@@ -8,6 +8,7 @@ from src.python.common.boto_common import (
     write_plan_file,
     print_lambda_plan,
     print_lambda_summary,
+    format_plan_lines,
 )
 
 
@@ -52,6 +53,32 @@ class TestPrintSummaryExitCount(unittest.TestCase):
 class TestPrintPlanEmptySafe(unittest.TestCase):
     def test_no_crash_on_empty(self):
         print_lambda_plan([], [])
+
+
+class TestOrphanReporting(unittest.TestCase):
+    def test_format_plan_lines_annotates_orphans_only(self):
+        results = [
+            {"account": "111", "region": "us-east-1", "function": "plain"},
+            {"account": "222", "region": "us-east-1", "function": "orph",
+             "orphaned_stack": "dead-stack"},
+        ]
+        lines = format_plan_lines(results)
+        self.assertEqual(lines[0], "111 | us-east-1 | plain")
+        self.assertEqual(lines[1], "222 | us-east-1 | orph (orphaned; stack dead-stack gone)")
+
+    def test_summary_reports_orphan_subcount(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = print_lambda_summary(
+                deleted=[{"account": "1", "region": "us-east-1", "function": "a",
+                          "orphaned_stack": "gone"},
+                         {"account": "1", "region": "us-east-1", "function": "b"}],
+                already_gone=[], failed=[], skipped_cfn=[], assume_role_failures=[])
+        out = buf.getvalue()
+        self.assertIn("2 deleted", out)
+        self.assertIn("1 orphaned CFN", out)
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

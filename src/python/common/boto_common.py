@@ -376,9 +376,16 @@ def build_account_rollup(results):
 
 def format_plan_lines(results):
     """One 'account | region | function' line per result, sorted for stable output
-    and easy diffing/grepping of the written plan file."""
-    return [f"{r['account']} | {r['region']} | {r['function']}"
-            for r in sorted(results, key=lambda r: (r["account"], r["region"], r["function"]))]
+    and easy diffing/grepping of the written plan file. Orphaned functions (their
+    CloudFormation stack no longer exists) are annotated so the plan makes the
+    reason for deletion explicit."""
+    lines = []
+    for r in sorted(results, key=lambda r: (r["account"], r["region"], r["function"])):
+        line = f"{r['account']} | {r['region']} | {r['function']}"
+        if r.get("orphaned_stack"):
+            line += f" (orphaned; stack {r['orphaned_stack']} gone)"
+        lines.append(line)
+    return lines
 
 
 LAMBDA_CLIENT_CONFIG = Config(
@@ -502,8 +509,11 @@ def print_lambda_plan(results, skipped_cfn):
     print(color("Lambda functions to delete (per account):", "blue"))
     for account_id, name, count in rollup:
         print(f"  {account_id} ({name})  {count} functions")
-    print(color(
-        f"Total: {len(results)} functions across {len(rollup)} accounts", "blue"))
+    orphan_count = sum(1 for r in results if r.get("orphaned_stack"))
+    total_line = f"Total: {len(results)} functions across {len(rollup)} accounts"
+    if orphan_count:
+        total_line += f" ({orphan_count} orphaned CFN — stack already deleted)"
+    print(color(total_line, "blue"))
     if results:
         print(color("Full list:", "blue"))
         for line in format_plan_lines(results):
@@ -511,7 +521,7 @@ def print_lambda_plan(results, skipped_cfn):
     if skipped_cfn:
         print(color(
             f"Skipped {len(skipped_cfn)} CloudFormation-managed function(s) "
-            f"(not deleted):", "yellow"))
+            f"(live stack, not deleted):", "yellow"))
         for s in sorted(skipped_cfn, key=lambda x: (x["account"], x["region"], x["function"])):
             print(f"  {s['account']} | {s['region']} | {s['function']} "
                   f"(stack: {s['stack']})")
@@ -533,9 +543,13 @@ def print_lambda_summary(deleted, already_gone, failed, skipped_cfn, assume_role
     accounts are reported separately and do NOT affect the exit code (an account
     we merely couldn't reach is a reported gap, not an operation failure)."""
     print(color("=" * 60, "blue"))
+    orphan_deleted = sum(1 for d in deleted if d.get("orphaned_stack"))
+    deleted_part = f"{len(deleted)} deleted"
+    if orphan_deleted:
+        deleted_part += f" ({orphan_deleted} orphaned CFN)"
     print(color(
-        f"Run summary: {len(deleted)} deleted | {len(already_gone)} already gone | "
-        f"{len(failed)} failed | {len(skipped_cfn)} skipped (CFN-managed) | "
+        f"Run summary: {deleted_part} | {len(already_gone)} already gone | "
+        f"{len(failed)} failed | {len(skipped_cfn)} skipped (live CFN stack) | "
         f"{len(assume_role_failures)} accounts unreachable (assume-role failed)", "blue"))
     for r in failed:
         print(color(
