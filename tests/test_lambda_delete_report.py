@@ -64,7 +64,9 @@ class TestOrphanReporting(unittest.TestCase):
         ]
         lines = format_plan_lines(results)
         self.assertEqual(lines[0], "111 | us-east-1 | plain")
-        self.assertEqual(lines[1], "222 | us-east-1 | orph (orphaned; stack dead-stack gone)")
+        # Orphan context is a 4th pipe field so field[2] stays the bare function name.
+        self.assertEqual(lines[1], "222 | us-east-1 | orph | orphaned (stack dead-stack gone)")
+        self.assertEqual(lines[1].split(" | ")[2], "orph")
 
     def test_summary_reports_orphan_subcount(self):
         import io, contextlib

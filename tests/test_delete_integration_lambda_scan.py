@@ -9,6 +9,45 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.python.utilities import organization_delete_integration as mod
 
 
+class TestReverifyOrphans(unittest.TestCase):
+    def _items(self):
+        return [
+            {"account": "111", "name": "a", "region": "us-east-1", "function": "plain"},
+            {"account": "111", "name": "a", "region": "us-east-1", "function": "orph",
+             "orphaned_stack": "dead"},
+        ]
+
+    def test_orphan_still_gone_is_kept_nonorphan_passthrough(self):
+        failed = []
+        with patch.object(mod, "list_live_stack_names", return_value={"other"}):
+            kept = mod._reverify_orphans(object(), "111", self._items(), failed)
+        self.assertEqual({k["function"] for k in kept}, {"plain", "orph"})
+        self.assertEqual(failed, [])
+
+    def test_recreated_stack_orphan_is_dropped_and_failed(self):
+        failed = []
+        with patch.object(mod, "list_live_stack_names", return_value={"dead"}):
+            kept = mod._reverify_orphans(object(), "111", self._items(), failed)
+        self.assertEqual([k["function"] for k in kept], ["plain"])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["function"], "orph")
+
+    def test_unverifiable_orphan_is_dropped_and_failed(self):
+        failed = []
+        with patch.object(mod, "list_live_stack_names", side_effect=RuntimeError("boom")):
+            kept = mod._reverify_orphans(object(), "111", self._items(), failed)
+        self.assertEqual([k["function"] for k in kept], ["plain"])
+        self.assertEqual(len(failed), 1)
+
+    def test_no_orphans_returns_items_unchanged_without_listing(self):
+        failed = []
+        items = [{"account": "111", "name": "a", "region": "us-east-1", "function": "plain"}]
+        with patch.object(mod, "list_live_stack_names") as lls:
+            kept = mod._reverify_orphans(object(), "111", items, failed)
+        self.assertEqual(kept, items)
+        lls.assert_not_called()
+
+
 class TestLambdaScanErrorsAffectExit(unittest.TestCase):
     def test_scan_gap_causes_nonzero_exit_even_on_just_print(self):
         accounts = [("111", "acct-a")]

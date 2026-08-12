@@ -125,6 +125,46 @@ def _scan_account_lambdas(sub_account, session, regions, pattern):
     return to_delete, skipped, scan_errors
 
 
+def _reverify_orphans(session, account_id, items, failed):
+    """Guard against a scan→delete race: an orphan classified because its stack was
+    gone at scan time could have had that stack recreated before this delete phase
+    reached it. Re-list the live stacks (per region) for this account's orphans and
+    drop any whose stack came back, or any we can no longer verify, recording each
+    in `failed` (a real miss that drives a non-zero exit) so it is never deleted.
+    Non-orphan items (no CloudFormation tag) pass through untouched. Returns the
+    list of items that are still safe to delete."""
+    orphan_regions = {it["region"] for it in items if it.get("orphaned_stack")}
+    if not orphan_regions:
+        return items
+    live_now = {}
+    for rg in orphan_regions:
+        try:
+            live_now[rg] = list_live_stack_names(session, rg)
+        except Exception as e:
+            # Can't re-verify — refuse to delete this region's orphans (safe default).
+            live_now[rg] = None
+            print(color(f"Account: {account_id} | Could not re-list stacks in {rg} to "
+                        f"re-verify orphans; those will be skipped: {e}", "yellow"))
+    kept = []
+    for it in items:
+        stack = it.get("orphaned_stack")
+        if not stack:
+            kept.append(it)
+            continue
+        live = live_now.get(it["region"])
+        if live is None:
+            failed.append(dict(it, reason="could not re-verify stack still gone at "
+                                          "delete time - not deleted"))
+        elif stack in live:
+            print(color(f"Account: {account_id} | Stack {stack} exists again - NOT "
+                        f"deleting {it['function']} ({it['region']})", "yellow"))
+            failed.append(dict(it, reason=f"stack {stack} was recreated during the run "
+                                          f"- not deleted"))
+        else:
+            kept.append(it)
+    return kept
+
+
 def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
                      pattern, just_print):
     pattern = validate_lambda_pattern(pattern)
@@ -244,6 +284,13 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
                 for it in items:
                     failed.append(dict(it, reason=f"delete skipped - could not assume "
                                                   f"role: {str(e)[:120]}"))
+                continue
+            # Re-verify orphans before deleting: a stack could have been (re)created
+            # between the scan and now (the delete phase re-assumes roles because the
+            # scan can outlive 1h STS creds). Never delete a Lambda whose stack came
+            # back. This runs single-threaded, before the delete pool below.
+            items = _reverify_orphans(session, account_id, items, failed)
+            if not items:
                 continue
             try:
                 # Warm the session's client-creation caches single-threaded; boto3

@@ -337,7 +337,32 @@ def filter_ll_stacks_from_url(sub_account_session, region, ll_url, return_only_n
 
 
 CFN_STACK_NAME_TAG = "aws:cloudformation:stack-name"
+CFN_STACK_ID_TAG = "aws:cloudformation:stack-id"
 LAMBDA_MIN_PATTERN_LEN = 3
+
+
+def region_from_stack_id(stack_id):
+    """Extract the region from a CloudFormation stack-id ARN
+    ('arn:aws:cloudformation:<region>:<acct>:stack/...'), or None if the id is
+    missing or not a well-formed ARN. Used to verify an orphan's stack in the
+    region that actually owns it rather than assuming the Lambda's own region."""
+    if not stack_id:
+        return None
+    parts = stack_id.split(":")
+    if len(parts) < 4 or parts[0] != "arn":
+        return None
+    return parts[3] or None
+
+
+def is_access_denied_error(e):
+    """True if the exception is a botocore AccessDenied ClientError. Lets the scan
+    fall back to the pre-orphan-detection behavior (skip CloudFormation-tagged
+    functions) when the role simply lacks cloudformation:ListStacks, instead of
+    turning every such function into a scan gap and a non-zero exit."""
+    response = getattr(e, "response", None)
+    if not isinstance(response, dict):
+        return False
+    return response.get("Error", {}).get("Code") in ("AccessDenied", "AccessDeniedException")
 
 
 def validate_lambda_pattern(pattern):
@@ -381,9 +406,12 @@ def format_plan_lines(results):
     reason for deletion explicit."""
     lines = []
     for r in sorted(results, key=lambda r: (r["account"], r["region"], r["function"])):
+        # Keep 'account | region | function' as the first three pipe-delimited
+        # fields so the plan file stays machine-parseable (split on ' | ', take
+        # field 2 for the function name). Orphan context goes in a 4th field.
         line = f"{r['account']} | {r['region']} | {r['function']}"
         if r.get("orphaned_stack"):
-            line += f" (orphaned; stack {r['orphaned_stack']} gone)"
+            line += f" | orphaned (stack {r['orphaned_stack']} gone)"
         lines.append(line)
     return lines
 
@@ -415,17 +443,28 @@ def list_live_stack_names(sub_account_session, region):
 def scan_lambdas_in_region(sub_account_session, region, pattern):
     """List Lambda functions in a region, keep those whose name matches pattern,
     and split them into (to_delete, skipped_cfn, scan_errors). A CloudFormation-
-    tagged function is checked against the region's live stacks: if its stack
-    still exists it is skipped (skipped_cfn, protected); if the stack is gone it
-    is an orphan and goes to to_delete annotated with 'orphaned_stack'. The live-
-    stack set is fetched lazily (only when a CFN-tagged match appears) and cached
-    for the region. If the stack list can't be read, or a function's tags can't
-    be read, the function is left out of to_delete and recorded in scan_errors —
-    we never guess 'delete' when we can't confirm the stack is gone."""
+    tagged function is checked against the live stacks in the region that owns its
+    stack (derived from the stack-id tag): if its stack still exists it is skipped
+    (skipped_cfn, protected); if the stack is gone it is an orphan and goes to
+    to_delete annotated with 'orphaned_stack'.
+
+    Safety rules (we never guess 'delete' when we can't confirm the stack is gone):
+    - A function whose stack lives in another region, or whose stack-id tag is
+      missing/malformed, is protected (skipped_cfn) — we only list THIS region's
+      stacks, so we can't confirm such a stack is gone.
+    - If the role lacks cloudformation:ListStacks (AccessDenied), fall back to the
+      pre-orphan-detection behavior: skip all CFN-tagged functions (skipped_cfn),
+      exit clean — no orphan detection is possible without that permission.
+    - Any other stack-list failure, or a per-function tag-read failure, records a
+      scan gap (scan_errors) and leaves the function out of to_delete.
+
+    The live-stack set is fetched lazily (only when a same-region CFN-tagged match
+    appears) and cached for the region."""
     client = sub_account_session.client("lambda", region_name=region, config=LAMBDA_CLIENT_CONFIG)
     to_delete, skipped_cfn, scan_errors = [], [], []
     live_stacks = None          # lazily fetched set of live stack names
     live_stacks_error = None    # set once if listing stacks failed (don't retry)
+    live_stacks_denied = False  # set once if ListStacks is not permitted (skip, don't gap)
     for page in client.get_paginator("list_functions").paginate():
         for fn in page["Functions"]:
             name = fn["FunctionName"]
@@ -442,12 +481,26 @@ def scan_lambdas_in_region(sub_account_session, region, pattern):
                 to_delete.append({"region": region, "function": name})
                 continue
             stack_name = tags[CFN_STACK_NAME_TAG]
-            if live_stacks is None and live_stacks_error is None:
+            # Only classify orphan status when the stack is owned by THIS region;
+            # otherwise we can't confirm it is gone from this region's stack list,
+            # so protect it.
+            if region_from_stack_id(tags.get(CFN_STACK_ID_TAG)) != region:
+                skipped_cfn.append(
+                    {"region": region, "function": name, "stack": stack_name})
+                continue
+            if live_stacks is None and live_stacks_error is None and not live_stacks_denied:
                 try:
                     live_stacks = list_live_stack_names(sub_account_session, region)
                 except Exception as e:
-                    live_stacks_error = str(e)[:150]
-            if live_stacks_error is not None:
+                    if is_access_denied_error(e):
+                        live_stacks_denied = True
+                    else:
+                        live_stacks_error = str(e)[:150]
+            if live_stacks_denied:
+                # No permission to verify — behave as before orphan detection existed.
+                skipped_cfn.append(
+                    {"region": region, "function": name, "stack": stack_name})
+            elif live_stacks_error is not None:
                 scan_errors.append(
                     {"region": region, "function": name,
                      "reason": f"could not list stacks to verify orphan status, "

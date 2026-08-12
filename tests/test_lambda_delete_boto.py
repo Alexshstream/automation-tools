@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
+from botocore.exceptions import ClientError
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.python.common import boto_common
@@ -152,6 +153,16 @@ class TestScanOrphanClassification(unittest.TestCase):
         session.client.return_value = client
         return session
 
+    @staticmethod
+    def _cfn_tags(stack_name, region="us-east-1"):
+        # A CFN-managed lambda carries both the stack-name and a stack-id ARN; the
+        # scan uses the ARN's region to verify the stack in its OWNING region.
+        return {
+            boto_common.CFN_STACK_NAME_TAG: stack_name,
+            boto_common.CFN_STACK_ID_TAG:
+                f"arn:aws:cloudformation:{region}:123456789012:stack/{stack_name}/uuid",
+        }
+
     def test_non_cfn_goes_to_delete_without_annotation(self):
         session = self._lambda_session([("MyCloudWatchColl", {})])
         with patch.object(boto_common, "list_live_stack_names") as lls:
@@ -162,8 +173,7 @@ class TestScanOrphanClassification(unittest.TestCase):
         lls.assert_not_called()            # lazy: no CFN match -> never listed
 
     def test_cfn_with_live_stack_is_skipped(self):
-        tags = {boto_common.CFN_STACK_NAME_TAG: "live-stack"}
-        session = self._lambda_session([("MyCloudWatchColl", tags)])
+        session = self._lambda_session([("MyCloudWatchColl", self._cfn_tags("live-stack"))])
         with patch.object(boto_common, "list_live_stack_names", return_value={"live-stack"}):
             to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
                 session, "us-east-1", "cloudwatch")
@@ -172,8 +182,7 @@ class TestScanOrphanClassification(unittest.TestCase):
         self.assertEqual(skipped[0]["stack"], "live-stack")
 
     def test_cfn_with_missing_stack_is_orphan(self):
-        tags = {boto_common.CFN_STACK_NAME_TAG: "gone-stack"}
-        session = self._lambda_session([("MyCloudWatchColl", tags)])
+        session = self._lambda_session([("MyCloudWatchColl", self._cfn_tags("gone-stack"))])
         with patch.object(boto_common, "list_live_stack_names", return_value={"other"}):
             to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
                 session, "us-east-1", "cloudwatch")
@@ -181,11 +190,48 @@ class TestScanOrphanClassification(unittest.TestCase):
         self.assertEqual(len(to_delete), 1)
         self.assertEqual(to_delete[0]["orphaned_stack"], "gone-stack")
 
-    def test_liststacks_error_becomes_scan_gap_not_delete(self):
-        tags = {boto_common.CFN_STACK_NAME_TAG: "gone-stack"}
-        session = self._lambda_session([("MyCloudWatchColl", tags)])
+    def test_stack_in_another_region_is_protected_not_orphan(self):
+        # Stack lives in eu-west-1; scanning us-east-1 can't confirm it is gone,
+        # so it must be protected (skipped), never deleted.
+        session = self._lambda_session(
+            [("MyCloudWatchColl", self._cfn_tags("elsewhere", region="eu-west-1"))])
         with patch.object(boto_common, "list_live_stack_names",
-                          side_effect=RuntimeError("denied")):
+                          return_value=set()) as lls:
+            to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
+                session, "us-east-1", "cloudwatch")
+        self.assertEqual(to_delete, [])
+        self.assertEqual(len(skipped), 1)
+        lls.assert_not_called()            # never even lists this region's stacks
+
+    def test_missing_stack_id_tag_is_protected_not_orphan(self):
+        # stack-name present but no stack-id ARN -> region unknown -> protect.
+        session = self._lambda_session(
+            [("MyCloudWatchColl", {boto_common.CFN_STACK_NAME_TAG: "no-id"})])
+        with patch.object(boto_common, "list_live_stack_names",
+                          return_value=set()) as lls:
+            to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
+                session, "us-east-1", "cloudwatch")
+        self.assertEqual(to_delete, [])
+        self.assertEqual(len(skipped), 1)
+        lls.assert_not_called()
+
+    def test_access_denied_falls_back_to_skip_not_gap(self):
+        # No cloudformation:ListStacks permission -> behave as before orphan
+        # detection: skip the CFN-tagged function, no scan gap.
+        denied = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}},
+                             "ListStacks")
+        session = self._lambda_session([("MyCloudWatchColl", self._cfn_tags("some-stack"))])
+        with patch.object(boto_common, "list_live_stack_names", side_effect=denied):
+            to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
+                session, "us-east-1", "cloudwatch")
+        self.assertEqual(to_delete, [])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(skipped), 1)
+
+    def test_liststacks_error_becomes_scan_gap_not_delete(self):
+        session = self._lambda_session([("MyCloudWatchColl", self._cfn_tags("gone-stack"))])
+        with patch.object(boto_common, "list_live_stack_names",
+                          side_effect=RuntimeError("boom")):
             to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
                 session, "us-east-1", "cloudwatch")
         self.assertEqual(to_delete, [])
@@ -193,9 +239,9 @@ class TestScanOrphanClassification(unittest.TestCase):
         self.assertEqual(len(errors), 1)
 
     def test_liststacks_fetched_once_for_multiple_cfn_matches(self):
-        t1 = {boto_common.CFN_STACK_NAME_TAG: "gone-1"}
-        t2 = {boto_common.CFN_STACK_NAME_TAG: "live-2"}
-        session = self._lambda_session([("CloudWatchA", t1), ("CloudWatchB", t2)])
+        session = self._lambda_session([
+            ("CloudWatchA", self._cfn_tags("gone-1")),
+            ("CloudWatchB", self._cfn_tags("live-2"))])
         with patch.object(boto_common, "list_live_stack_names",
                           return_value={"live-2"}) as lls:
             to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
@@ -203,6 +249,29 @@ class TestScanOrphanClassification(unittest.TestCase):
         lls.assert_called_once()           # cached, not per-match
         self.assertEqual(len(to_delete), 1)   # gone-1 orphan
         self.assertEqual(len(skipped), 1)     # live-2 protected
+
+
+class TestStackIdRegion(unittest.TestCase):
+    def test_parses_region_from_arn(self):
+        arn = "arn:aws:cloudformation:eu-west-1:123456789012:stack/my-stack/abc"
+        self.assertEqual(boto_common.region_from_stack_id(arn), "eu-west-1")
+
+    def test_none_for_missing_or_malformed(self):
+        self.assertIsNone(boto_common.region_from_stack_id(None))
+        self.assertIsNone(boto_common.region_from_stack_id(""))
+        self.assertIsNone(boto_common.region_from_stack_id("not-an-arn"))
+
+
+class TestAccessDeniedDetection(unittest.TestCase):
+    def test_true_for_access_denied_client_error(self):
+        for code in ("AccessDenied", "AccessDeniedException"):
+            err = ClientError({"Error": {"Code": code, "Message": "x"}}, "ListStacks")
+            self.assertTrue(boto_common.is_access_denied_error(err))
+
+    def test_false_for_other_errors(self):
+        throttle = ClientError({"Error": {"Code": "Throttling", "Message": "x"}}, "ListStacks")
+        self.assertFalse(boto_common.is_access_denied_error(throttle))
+        self.assertFalse(boto_common.is_access_denied_error(RuntimeError("plain")))
 
 
 if __name__ == "__main__":
