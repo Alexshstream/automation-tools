@@ -132,7 +132,12 @@ def _reverify_orphans(session, account_id, items, failed):
     drop any whose stack came back, or any we can no longer verify, recording each
     in `failed` (a real miss that drives a non-zero exit) so it is never deleted.
     Non-orphan items (no CloudFormation tag) pass through untouched. Returns the
-    list of items that are still safe to delete."""
+    list of items that are still safe to delete.
+
+    Relies on the scan-time invariant that an orphan's region equals its stack's
+    owning region (scan_lambdas_in_region only classifies an orphan when
+    region_from_stack_id(stack) == the scan region), so re-listing by it["region"]
+    checks the correct region."""
     orphan_regions = {it["region"] for it in items if it.get("orphaned_stack")}
     if not orphan_regions:
         return items
@@ -285,14 +290,16 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
                     failed.append(dict(it, reason=f"delete skipped - could not assume "
                                                   f"role: {str(e)[:120]}"))
                 continue
-            # Re-verify orphans before deleting: a stack could have been (re)created
-            # between the scan and now (the delete phase re-assumes roles because the
-            # scan can outlive 1h STS creds). Never delete a Lambda whose stack came
-            # back. This runs single-threaded, before the delete pool below.
-            items = _reverify_orphans(session, account_id, items, failed)
-            if not items:
-                continue
             try:
+                # Re-verify orphans before deleting: a stack could have been
+                # (re)created between the scan and now (the delete phase re-assumes
+                # roles because the scan can outlive 1h STS creds). Never delete a
+                # Lambda whose stack came back. Single-threaded, before the pool, and
+                # inside this try so an unexpected error here can't crash the whole
+                # run — the except below records this account's items as failed.
+                items = _reverify_orphans(session, account_id, items, failed)
+                if not items:
+                    continue
                 # Warm the session's client-creation caches single-threaded; boto3
                 # Session is not thread-safe for concurrent first-time client creation.
                 session.client("lambda", region_name=items[0]["region"])
