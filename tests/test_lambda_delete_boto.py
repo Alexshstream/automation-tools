@@ -7,6 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.python.common.boto_common import (
     scan_lambdas_in_region,
     delete_lambda_function,
+    list_live_stack_names,
     CFN_STACK_NAME_TAG,
 )
 
@@ -88,6 +89,43 @@ class TestDeleteLambdaFunction(unittest.TestCase):
         client.delete_function.side_effect = not_found()
         session = _session_with_lambda(client)
         self.assertEqual(delete_lambda_function(session, "us-east-1", "fn"), "already gone")
+
+
+class TestListLiveStackNames(unittest.TestCase):
+    def _session_with_pages(self, pages):
+        client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = pages
+        client.get_paginator.return_value = paginator
+        session = MagicMock()
+        session.client.return_value = client
+        return session, client
+
+    def test_returns_live_names_and_filters_delete_complete(self):
+        pages = [{"StackSummaries": [
+            {"StackName": "live-a", "StackStatus": "CREATE_COMPLETE"},
+            {"StackName": "gone-b", "StackStatus": "DELETE_COMPLETE"},
+            {"StackName": "live-c", "StackStatus": "UPDATE_COMPLETE"},
+        ]}]
+        session, _ = self._session_with_pages(pages)
+        result = list_live_stack_names(session, "us-east-1")
+        self.assertEqual(result, {"live-a", "live-c"})
+
+    def test_paginates_across_pages(self):
+        pages = [
+            {"StackSummaries": [{"StackName": "a", "StackStatus": "CREATE_COMPLETE"}]},
+            {"StackSummaries": [{"StackName": "b", "StackStatus": "CREATE_COMPLETE"}]},
+        ]
+        session, _ = self._session_with_pages(pages)
+        self.assertEqual(list_live_stack_names(session, "us-east-1"), {"a", "b"})
+
+    def test_api_error_propagates(self):
+        session = MagicMock()
+        client = MagicMock()
+        client.get_paginator.side_effect = RuntimeError("access denied")
+        session.client.return_value = client
+        with self.assertRaises(RuntimeError):
+            list_live_stack_names(session, "us-east-1")
 
 
 if __name__ == "__main__":

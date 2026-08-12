@@ -388,6 +388,23 @@ LAMBDA_CLIENT_CONFIG = Config(
 )
 
 
+def list_live_stack_names(sub_account_session, region):
+    """Return the set of CloudFormation stack names that currently exist (any
+    status except DELETE_COMPLETE) in the region. Used to tell a live
+    CloudFormation-managed Lambda from an orphan whose stack was already deleted.
+    Raises on API failure so the caller can treat the region's stack state as
+    unknown and skip rather than guess. Reuses LAMBDA_CLIENT_CONFIG only for its
+    adaptive-retry/timeout settings (not Lambda-specific)."""
+    client = sub_account_session.client(
+        "cloudformation", region_name=region, config=LAMBDA_CLIENT_CONFIG)
+    live = set()
+    for page in client.get_paginator("list_stacks").paginate():
+        for s in page["StackSummaries"]:
+            if s["StackStatus"] != "DELETE_COMPLETE":
+                live.add(s["StackName"])
+    return live
+
+
 def scan_lambdas_in_region(sub_account_session, region, pattern):
     """List Lambda functions in a region, keep those whose name matches pattern,
     and split them into (to_delete, skipped_cfn, scan_errors). A function tagged
