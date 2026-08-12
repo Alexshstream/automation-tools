@@ -407,14 +407,18 @@ def list_live_stack_names(sub_account_session, region):
 
 def scan_lambdas_in_region(sub_account_session, region, pattern):
     """List Lambda functions in a region, keep those whose name matches pattern,
-    and split them into (to_delete, skipped_cfn, scan_errors). A function tagged
-    as CloudFormation-managed goes to skipped_cfn with its owning stack name; it
-    is never deleted. list_tags is called only for name-matched functions, and a
-    per-function tag failure never aborts the region scan: the function is left
-    out of to_delete (we can't confirm it isn't CFN-managed, so deleting it would
-    be unsafe) and recorded in scan_errors so the operator sees the gap."""
+    and split them into (to_delete, skipped_cfn, scan_errors). A CloudFormation-
+    tagged function is checked against the region's live stacks: if its stack
+    still exists it is skipped (skipped_cfn, protected); if the stack is gone it
+    is an orphan and goes to to_delete annotated with 'orphaned_stack'. The live-
+    stack set is fetched lazily (only when a CFN-tagged match appears) and cached
+    for the region. If the stack list can't be read, or a function's tags can't
+    be read, the function is left out of to_delete and recorded in scan_errors —
+    we never guess 'delete' when we can't confirm the stack is gone."""
     client = sub_account_session.client("lambda", region_name=region, config=LAMBDA_CLIENT_CONFIG)
     to_delete, skipped_cfn, scan_errors = [], [], []
+    live_stacks = None          # lazily fetched set of live stack names
+    live_stacks_error = None    # set once if listing stacks failed (don't retry)
     for page in client.get_paginator("list_functions").paginate():
         for fn in page["Functions"]:
             name = fn["FunctionName"]
@@ -427,11 +431,26 @@ def scan_lambdas_in_region(sub_account_session, region, pattern):
                     {"region": region, "function": name,
                      "reason": f"could not read tags, left out of plan: {str(e)[:150]}"})
                 continue
-            if is_cfn_managed(tags):
-                skipped_cfn.append(
-                    {"region": region, "function": name, "stack": tags[CFN_STACK_NAME_TAG]})
-            else:
+            if not is_cfn_managed(tags):
                 to_delete.append({"region": region, "function": name})
+                continue
+            stack_name = tags[CFN_STACK_NAME_TAG]
+            if live_stacks is None and live_stacks_error is None:
+                try:
+                    live_stacks = list_live_stack_names(sub_account_session, region)
+                except Exception as e:
+                    live_stacks_error = str(e)[:150]
+            if live_stacks_error is not None:
+                scan_errors.append(
+                    {"region": region, "function": name,
+                     "reason": f"could not list stacks to verify orphan status, "
+                               f"left out of plan: {live_stacks_error}"})
+            elif stack_name in live_stacks:
+                skipped_cfn.append(
+                    {"region": region, "function": name, "stack": stack_name})
+            else:
+                to_delete.append(
+                    {"region": region, "function": name, "orphaned_stack": stack_name})
     return to_delete, skipped_cfn, scan_errors
 
 
