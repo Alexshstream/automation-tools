@@ -96,8 +96,11 @@ def _scan_account_lambdas(sub_account, session, regions, pattern):
             item.update({"account": sub_account[0], "name": sub_account[1]})
 
     # Warm the session's client-creation caches single-threaded; boto3 Session
-    # is not thread-safe for concurrent first-time client creation.
+    # is not thread-safe for concurrent first-time client creation. The region
+    # threads below create both a lambda client (the scan) and a cloudformation
+    # client (the orphan stack-existence check), so warm both services here.
     session.client("lambda", region_name=regions[0])
+    session.client("cloudformation", region_name=regions[0])
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_to_region = {
             executor.submit(scan_lambdas_in_region, session, region, pattern): region

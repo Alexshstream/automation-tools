@@ -115,6 +115,11 @@ class TestListLiveStackNames(unittest.TestCase):
         session, _ = self._session_with_pages(pages)
         result = list_live_stack_names(session, "us-east-1")
         self.assertEqual(result, {"live-a", "live-c"})
+        # Built for the cloudformation service in the right region with the
+        # shared retry/timeout config — guards against a wrong service string.
+        session.client.assert_called_once_with(
+            "cloudformation", region_name="us-east-1",
+            config=boto_common.LAMBDA_CLIENT_CONFIG)
 
     def test_paginates_across_pages(self):
         pages = [
