@@ -100,7 +100,10 @@ def _scan_account_lambdas(sub_account, session, regions, pattern):
     # threads below create both a lambda client (the scan) and a cloudformation
     # client (the orphan stack-existence check), so warm both services here.
     session.client("lambda", region_name=regions[0])
-    session.client("cloudformation", region_name=regions[0])
+    # Also force the cloudformation client AND its list_stacks paginator model to
+    # load single-threaded here — the orphan check calls get_paginator inside the
+    # region threads, and first-loading the paginator config concurrently races.
+    session.client("cloudformation", region_name=regions[0]).get_paginator("list_stacks")
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_to_region = {
             executor.submit(scan_lambdas_in_region, session, region, pattern): region

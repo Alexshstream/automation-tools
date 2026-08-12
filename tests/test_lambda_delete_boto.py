@@ -203,6 +203,18 @@ class TestScanOrphanClassification(unittest.TestCase):
         self.assertEqual(len(skipped), 1)
         lls.assert_not_called()            # never even lists this region's stacks
 
+    def test_empty_stack_name_tag_is_protected_not_deleted(self):
+        # stack-name tag present but empty -> can't identify the stack -> protect,
+        # never fall through and delete it as a plain (non-CFN) function.
+        session = self._lambda_session(
+            [("MyCloudWatchColl", {boto_common.CFN_STACK_NAME_TAG: ""})])
+        with patch.object(boto_common, "list_live_stack_names") as lls:
+            to_delete, skipped, errors = boto_common.scan_lambdas_in_region(
+                session, "us-east-1", "cloudwatch")
+        self.assertEqual(to_delete, [])
+        self.assertEqual(len(skipped), 1)
+        lls.assert_not_called()
+
     def test_missing_stack_id_tag_is_protected_not_orphan(self):
         # stack-name present but no stack-id ARN -> region unknown -> protect.
         session = self._lambda_session(
@@ -268,8 +280,17 @@ class TestAccessDeniedDetection(unittest.TestCase):
             err = ClientError({"Error": {"Code": code, "Message": "x"}}, "ListStacks")
             self.assertTrue(boto_common.is_access_denied_error(err))
 
+    def test_true_for_other_403_denial(self):
+        # An SCP/permission-boundary denial with a different code but HTTP 403.
+        err = ClientError(
+            {"Error": {"Code": "AuthorizationError", "Message": "x"},
+             "ResponseMetadata": {"HTTPStatusCode": 403}}, "ListStacks")
+        self.assertTrue(boto_common.is_access_denied_error(err))
+
     def test_false_for_other_errors(self):
-        throttle = ClientError({"Error": {"Code": "Throttling", "Message": "x"}}, "ListStacks")
+        throttle = ClientError(
+            {"Error": {"Code": "Throttling", "Message": "x"},
+             "ResponseMetadata": {"HTTPStatusCode": 400}}, "ListStacks")
         self.assertFalse(boto_common.is_access_denied_error(throttle))
         self.assertFalse(boto_common.is_access_denied_error(RuntimeError("plain")))
 

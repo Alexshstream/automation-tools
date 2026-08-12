@@ -362,7 +362,11 @@ def is_access_denied_error(e):
     response = getattr(e, "response", None)
     if not isinstance(response, dict):
         return False
-    return response.get("Error", {}).get("Code") in ("AccessDenied", "AccessDeniedException")
+    if response.get("Error", {}).get("Code") in ("AccessDenied", "AccessDeniedException"):
+        return True
+    # Catch other authorization denials (SCP / permission-boundary) that surface a
+    # different error code but the same HTTP 403 — still "can't verify", skip clean.
+    return response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 403
 
 
 def validate_lambda_pattern(pattern):
@@ -481,6 +485,13 @@ def scan_lambdas_in_region(sub_account_session, region, pattern):
                 to_delete.append({"region": region, "function": name})
                 continue
             stack_name = tags[CFN_STACK_NAME_TAG]
+            if not stack_name:
+                # CFN-managed (tag present) but the stack-name value is empty, so we
+                # can't identify the owning stack. Protect it rather than fall through
+                # and delete it as if it had no CloudFormation tag at all.
+                skipped_cfn.append(
+                    {"region": region, "function": name, "stack": stack_name})
+                continue
             # Only classify orphan status when the stack is owned by THIS region;
             # otherwise we can't confirm it is gone from this region's stack list,
             # so protect it.
@@ -574,7 +585,7 @@ def print_lambda_plan(results, skipped_cfn):
     if skipped_cfn:
         print(color(
             f"Skipped {len(skipped_cfn)} CloudFormation-managed function(s) "
-            f"(live stack, not deleted):", "yellow"))
+            f"(not deleted):", "yellow"))
         for s in sorted(skipped_cfn, key=lambda x: (x["account"], x["region"], x["function"])):
             print(f"  {s['account']} | {s['region']} | {s['function']} "
                   f"(stack: {s['stack']})")
@@ -602,7 +613,7 @@ def print_lambda_summary(deleted, already_gone, failed, skipped_cfn, assume_role
         deleted_part += f" ({orphan_deleted} orphaned CFN)"
     print(color(
         f"Run summary: {deleted_part} | {len(already_gone)} already gone | "
-        f"{len(failed)} failed | {len(skipped_cfn)} skipped (live CFN stack) | "
+        f"{len(failed)} failed | {len(skipped_cfn)} skipped (CFN-managed) | "
         f"{len(assume_role_failures)} accounts unreachable (assume-role failed)", "blue"))
     for r in failed:
         print(color(
