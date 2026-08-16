@@ -33,15 +33,18 @@ class TestScanLambdasInRegion(unittest.TestCase):
         }]
         client.get_paginator.return_value = paginator
         client.list_tags.side_effect = lambda Resource: (
-            {"Tags": {CFN_STACK_NAME_TAG: "LightlyticsStack-x"}} if Resource == "arn:B"
-            else {"Tags": {}}
+            {"Tags": {CFN_STACK_NAME_TAG: "LightlyticsStack-x",
+                      boto_common.CFN_STACK_ID_TAG:
+                          "arn:aws:cloudformation:us-east-1:123:stack/LightlyticsStack-x/u"}}
+            if Resource == "arn:B" else {"Tags": {}}
         )
         session = _session_with_lambda(client)
 
-        # StreamSec_B's stack is live, so it stays protected (skipped_cfn) rather
-        # than being reclassified as an orphan.
+        # StreamSec_B's stack-id is in this region, so the scan actually lists live
+        # stacks; its stack IS live, so it stays protected (skipped_cfn) via the
+        # stack_name-in-live-set path rather than being reclassified as an orphan.
         with patch.object(boto_common, "list_live_stack_names",
-                           return_value={"LightlyticsStack-x"}):
+                           return_value={"LightlyticsStack-x"}) as lls:
             to_delete, skipped, scan_errors = scan_lambdas_in_region(session, "us-east-1", "streamsec")
 
         self.assertEqual([d["function"] for d in to_delete], ["StreamSec_A"])
@@ -51,6 +54,8 @@ class TestScanLambdasInRegion(unittest.TestCase):
         self.assertEqual(scan_errors, [])
         # list_tags must be called only for name-matched functions (A and B), not C
         self.assertEqual(client.list_tags.call_count, 2)
+        # the live-stack protection path was actually exercised (stack list consulted)
+        lls.assert_called_once()
 
     def test_tag_failure_excludes_function_and_records_error(self):
         client = MagicMock()
@@ -280,13 +285,14 @@ class TestAccessDeniedDetection(unittest.TestCase):
             err = ClientError({"Error": {"Code": code, "Message": "x"}}, "ListStacks")
             self.assertTrue(boto_common.is_access_denied_error(err))
 
-    def test_true_for_authorization_denial_codes(self):
-        # SCP / permission-boundary denials surface as these codes.
+    def test_false_for_non_cfn_denial_codes(self):
+        # CloudFormation ListStacks emits AccessDenied; EC2-style codes like these
+        # are not emitted by CFN, so they fall through to the safe scan-gap path.
         for code in ("AuthorizationError", "UnauthorizedOperation"):
             err = ClientError(
                 {"Error": {"Code": code, "Message": "x"},
                  "ResponseMetadata": {"HTTPStatusCode": 403}}, "ListStacks")
-            self.assertTrue(boto_common.is_access_denied_error(err))
+            self.assertFalse(boto_common.is_access_denied_error(err))
 
     def test_false_for_expired_token_even_though_403(self):
         # Transient credential expiry is HTTP 403 but must NOT be treated as a

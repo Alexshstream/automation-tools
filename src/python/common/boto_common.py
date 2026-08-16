@@ -354,10 +354,10 @@ def region_from_stack_id(stack_id):
     return parts[3] or None
 
 
-# Error codes that mean "authorization denied" (permission, SCP, permission
-# boundary). Deliberately excludes transient/credential 403s like ExpiredToken.
-_ACCESS_DENIED_CODES = (
-    "AccessDenied", "AccessDeniedException", "AuthorizationError", "UnauthorizedOperation")
+# CloudFormation ListStacks surfaces authorization denials (IAM, SCP, permission
+# boundary) as AccessDenied. Deliberately excludes transient/credential 403s like
+# ExpiredToken (those must fall through to the scan-gap path, not skip clean).
+_ACCESS_DENIED_CODES = ("AccessDenied", "AccessDeniedException")
 
 
 def is_access_denied_error(e):
