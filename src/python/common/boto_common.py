@@ -494,6 +494,7 @@ def scan_lambdas_in_region(sub_account_session, region, pattern, account_id):
     The live-stack set is fetched lazily (only when a same-account/region CFN-tagged
     match appears) and cached for the region."""
     client = sub_account_session.client("lambda", region_name=region, config=LAMBDA_CLIENT_CONFIG)
+    account_id = str(account_id)   # compare like-for-like against the ARN's account field
     to_delete, skipped_cfn, scan_errors = [], [], []
     live_stacks = None          # lazily fetched set of live stack names
     live_stacks_error = None    # set once if listing stacks failed (don't retry)
@@ -519,7 +520,8 @@ def scan_lambdas_in_region(sub_account_session, region, pattern, account_id):
                 # empty or absent, so we can't identify the owning stack. Protect it
                 # rather than fall through and delete it as if it had no CFN tag.
                 skipped_cfn.append(
-                    {"region": region, "function": name, "stack": stack_name or ""})
+                    {"region": region, "function": name,
+                     "stack": "unknown - stack-id tag only"})
                 continue
             # Only classify orphan status when the stack is owned by THIS account AND
             # region; otherwise we would be listing the wrong account/region's stacks

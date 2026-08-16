@@ -71,6 +71,7 @@ class TestReverifyWiredIntoRun(unittest.TestCase):
                 patch.object(mod, "_reverify_orphans", wraps=mod._reverify_orphans) as spy, \
                 patch.object(mod, "delete_lambda_function",
                              side_effect=lambda s, r, f: deleted.append(f) or "deleted"), \
+                patch.object(mod, "write_plan_file"), \
                 patch.object(mod, "list_live_stack_names", **list_kwargs):
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = mod._run_lambda_mode(accounts, sts_client=None,
@@ -130,6 +131,7 @@ class TestLambdaScanErrorsAffectExit(unittest.TestCase):
 
         with patch.object(mod, "_session_for_account", return_value=object()), \
                 patch.object(mod, "_scan_account_lambdas", side_effect=fake_scan), \
+                patch.object(mod, "write_plan_file"), \
                 patch.object(mod.sys.stdin, "isatty", return_value=False):
             # just_print=False so it reaches confirm_deletion, which refuses on the
             # non-TTY stdin — the run must NOT report success.
@@ -175,6 +177,7 @@ class TestLambdaScanErrorsAffectExit(unittest.TestCase):
         with patch.object(mod, "_session_for_account", side_effect=fake_session), \
                 patch.object(mod, "_scan_account_lambdas", side_effect=fake_scan), \
                 patch.object(mod, "confirm_deletion", return_value=True), \
+                patch.object(mod, "write_plan_file"), \
                 contextlib.redirect_stdout(buf):
             rc = mod._run_lambda_mode(accounts, sts_client=None, management_account_id="999",
                                       regions=["us-east-1"], pattern="target", just_print=False)
