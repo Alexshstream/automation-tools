@@ -52,6 +52,45 @@ class TestReverifyOrphans(unittest.TestCase):
         lls.assert_not_called()
 
 
+class TestReverifyWiredIntoRun(unittest.TestCase):
+    """_reverify_orphans is exercised in isolation elsewhere; these confirm
+    _run_lambda_mode actually calls it and that its outcomes drive the exit code."""
+
+    def _run(self, list_kwargs):
+        accounts = [("111", "acct-a")]
+        orphan = {"account": "111", "name": "acct-a", "region": "us-east-1",
+                  "function": "orph", "orphaned_stack": "dead"}
+
+        def fake_scan(sub_account, session, regions, pattern):
+            return [dict(orphan)], [], []
+
+        deleted = []
+        with patch.object(mod, "_session_for_account", return_value=object()), \
+                patch.object(mod, "_scan_account_lambdas", side_effect=fake_scan), \
+                patch.object(mod, "confirm_deletion", return_value=True), \
+                patch.object(mod, "_reverify_orphans", wraps=mod._reverify_orphans) as spy, \
+                patch.object(mod, "delete_lambda_function",
+                             side_effect=lambda s, r, f: deleted.append(f) or "deleted"), \
+                patch.object(mod, "list_live_stack_names", **list_kwargs):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = mod._run_lambda_mode(accounts, sts_client=None,
+                                          management_account_id="999",
+                                          regions=["us-east-1"], pattern="orph",
+                                          just_print=False)
+        spy.assert_called()          # the delete phase is wired to call _reverify_orphans
+        return rc, deleted
+
+    def test_recreated_stack_orphan_not_deleted_exit_zero(self):
+        rc, deleted = self._run({"return_value": {"dead"}})   # stack came back
+        self.assertEqual(deleted, [])          # protected, not deleted
+        self.assertEqual(rc, 0)                # correct protection -> clean exit
+
+    def test_unverifiable_orphan_not_deleted_exit_nonzero(self):
+        rc, deleted = self._run({"side_effect": RuntimeError("boom")})
+        self.assertEqual(deleted, [])          # not deleted
+        self.assertNotEqual(rc, 0)             # a real gap -> non-zero exit
+
+
 class TestLambdaScanErrorsAffectExit(unittest.TestCase):
     def test_scan_gap_causes_nonzero_exit_even_on_just_print(self):
         accounts = [("111", "acct-a")]

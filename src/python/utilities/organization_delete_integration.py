@@ -61,9 +61,12 @@ def build_arg_parser():
     parser.add_argument(
         "--lambda_name_contains",
         help="LAMBDA-ONLY MODE: delete only Lambda functions whose name contains this "
-        "string (case-insensitive, min 3 chars). Does NOT touch CloudFormation stacks and "
-        "does NOT remove the Stream Security integration. Mutually exclusive with the "
-        "stack-only flags.", required=False)
+        "string (case-insensitive, min 3 chars). Deletes only functions whose "
+        "CloudFormation stack no longer exists (orphans); functions owned by a live "
+        "stack are skipped. Requires cloudformation:ListStacks in each target account/"
+        "region to detect orphans (without it, all CFN-tagged functions are skipped). "
+        "Does NOT touch CloudFormation stacks or remove the Stream Security integration. "
+        "Mutually exclusive with the stack-only flags.", required=False)
     return parser
 
 
@@ -106,7 +109,8 @@ def _scan_account_lambdas(sub_account, session, regions, pattern):
     session.client("cloudformation", region_name=regions[0]).get_paginator("list_stacks")
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_to_region = {
-            executor.submit(scan_lambdas_in_region, session, region, pattern): region
+            executor.submit(scan_lambdas_in_region, session, region, pattern,
+                            sub_account[0]): region
             for region in regions}
         for future in concurrent.futures.as_completed(future_to_region):
             region = future_to_region[future]
@@ -144,10 +148,10 @@ def _reverify_orphans(session, account_id, items, failed):
     Orphans we can no longer verify are appended to `failed` (a real gap that drives
     a non-zero exit) so they are never deleted on an unverified guess.
 
-    Relies on the scan-time invariant that an orphan's region equals its stack's
-    owning region (scan_lambdas_in_region only classifies an orphan when
-    region_from_stack_id(stack) == the scan region), so re-listing by it["region"]
-    checks the correct region."""
+    Relies on the scan-time invariant that an orphan's region AND account equal its
+    stack's owning region/account (scan_lambdas_in_region only classifies an orphan
+    when both the stack-id region and account match the scanned account/region), so
+    re-listing this account's stacks by it["region"] checks the correct place."""
     orphan_regions = {it["region"] for it in items if it.get("orphaned_stack")}
     if not orphan_regions:
         return items, []
@@ -161,7 +165,7 @@ def _reverify_orphans(session, account_id, items, failed):
             live_now[rg] = None
             print(color(f"Account: {account_id} | Could not re-list stacks in {rg} to "
                         f"re-verify orphans; those are recorded as failed (not deleted): "
-                        f"{e}", "yellow"))
+                        f"{str(e)[:150]}", "yellow"))
     kept, reprotected = [], []
     for it in items:
         stack = it.get("orphaned_stack")

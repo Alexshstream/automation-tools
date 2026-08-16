@@ -341,17 +341,35 @@ CFN_STACK_ID_TAG = "aws:cloudformation:stack-id"
 LAMBDA_MIN_PATTERN_LEN = 3
 
 
-def region_from_stack_id(stack_id):
-    """Extract the region from a CloudFormation stack-id ARN
-    ('arn:aws:cloudformation:<region>:<acct>:stack/...'), or None if the id is
-    missing or not a well-formed ARN. Used to verify an orphan's stack in the
-    region that actually owns it rather than assuming the Lambda's own region."""
+def _stack_id_parts(stack_id):
+    """Split a CloudFormation stack-id ARN into its fields, or None if it is
+    missing or not a well-formed cloudformation ARN. Requires the service segment
+    to be 'cloudformation' so a stray non-CFN ARN (e.g. arn:aws:lambda:...) is not
+    mistaken for a stack reference."""
     if not stack_id:
         return None
     parts = stack_id.split(":")
-    if len(parts) < 4 or parts[0] != "arn":
+    # arn:aws:cloudformation:<region>:<account>:stack/<name>/<uuid>  -> 6 fields
+    if len(parts) < 6 or parts[0] != "arn" or parts[2] != "cloudformation":
         return None
-    return parts[3] or None
+    return parts
+
+
+def region_from_stack_id(stack_id):
+    """Region from a CloudFormation stack-id ARN, or None if missing/malformed.
+    Used to verify an orphan's stack in the region that actually owns it rather
+    than assuming the Lambda's own region."""
+    parts = _stack_id_parts(stack_id)
+    return (parts[3] or None) if parts else None
+
+
+def account_from_stack_id(stack_id):
+    """Account id from a CloudFormation stack-id ARN, or None if missing/malformed.
+    Used together with the region so a stack-id pointing at a DIFFERENT account is
+    never treated as owned by the account being scanned (which would list the wrong
+    account's stacks and could misclassify a live-stack Lambda as an orphan)."""
+    parts = _stack_id_parts(stack_id)
+    return (parts[4] or None) if parts else None
 
 
 # CloudFormation ListStacks surfaces authorization denials (IAM, SCP, permission
@@ -392,8 +410,11 @@ def lambda_name_matches(function_name, pattern):
 
 
 def is_cfn_managed(tags):
-    """True if the Lambda's tags mark it as CloudFormation-managed."""
-    return CFN_STACK_NAME_TAG in (tags or {})
+    """True if the Lambda's tags mark it as CloudFormation-managed. Either the
+    stack-name or the stack-id tag counts, so a function carrying only a stack-id
+    is not mistaken for a plain (non-CFN) function and deleted unconditionally."""
+    tags = tags or {}
+    return CFN_STACK_NAME_TAG in tags or CFN_STACK_ID_TAG in tags
 
 
 def build_account_rollup(results):
@@ -451,26 +472,27 @@ def list_live_stack_names(sub_account_session, region):
     return live
 
 
-def scan_lambdas_in_region(sub_account_session, region, pattern):
+def scan_lambdas_in_region(sub_account_session, region, pattern, account_id):
     """List Lambda functions in a region, keep those whose name matches pattern,
     and split them into (to_delete, skipped_cfn, scan_errors). A CloudFormation-
-    tagged function is checked against the live stacks in the region that owns its
-    stack (derived from the stack-id tag): if its stack still exists it is skipped
-    (skipped_cfn, protected); if the stack is gone it is an orphan and goes to
-    to_delete annotated with 'orphaned_stack'.
+    tagged function is checked against the live stacks in the region/account that
+    own its stack (derived from the stack-id tag): if its stack still exists it is
+    skipped (skipped_cfn, protected); if the stack is gone it is an orphan and goes
+    to to_delete annotated with 'orphaned_stack'.
 
     Safety rules (we never guess 'delete' when we can't confirm the stack is gone):
-    - A function whose stack lives in another region, or whose stack-id tag is
-      missing/malformed, is protected (skipped_cfn) — we only list THIS region's
-      stacks, so we can't confirm such a stack is gone.
+    - A function whose stack lives in another region OR another account, or whose
+      stack-id tag is missing/malformed, is protected (skipped_cfn) — we only list
+      THIS account/region's stacks, so we can't confirm such a stack is gone.
     - If the role lacks cloudformation:ListStacks (AccessDenied), fall back to the
       pre-orphan-detection behavior: skip all CFN-tagged functions (skipped_cfn),
-      exit clean — no orphan detection is possible without that permission.
+      exit clean — no orphan detection is possible without that permission — and
+      print a warning so the operator knows detection was skipped for this region.
     - Any other stack-list failure, or a per-function tag-read failure, records a
       scan gap (scan_errors) and leaves the function out of to_delete.
 
-    The live-stack set is fetched lazily (only when a same-region CFN-tagged match
-    appears) and cached for the region."""
+    The live-stack set is fetched lazily (only when a same-account/region CFN-tagged
+    match appears) and cached for the region."""
     client = sub_account_session.client("lambda", region_name=region, config=LAMBDA_CLIENT_CONFIG)
     to_delete, skipped_cfn, scan_errors = [], [], []
     live_stacks = None          # lazily fetched set of live stack names
@@ -491,18 +513,20 @@ def scan_lambdas_in_region(sub_account_session, region, pattern):
             if not is_cfn_managed(tags):
                 to_delete.append({"region": region, "function": name})
                 continue
-            stack_name = tags[CFN_STACK_NAME_TAG]
+            stack_name = tags.get(CFN_STACK_NAME_TAG)
             if not stack_name:
-                # CFN-managed (tag present) but the stack-name value is empty, so we
-                # can't identify the owning stack. Protect it rather than fall through
-                # and delete it as if it had no CloudFormation tag at all.
+                # CFN-managed (a CFN tag is present) but the stack-name value is
+                # empty or absent, so we can't identify the owning stack. Protect it
+                # rather than fall through and delete it as if it had no CFN tag.
                 skipped_cfn.append(
-                    {"region": region, "function": name, "stack": stack_name})
+                    {"region": region, "function": name, "stack": stack_name or ""})
                 continue
-            # Only classify orphan status when the stack is owned by THIS region;
-            # otherwise we can't confirm it is gone from this region's stack list,
-            # so protect it.
-            if region_from_stack_id(tags.get(CFN_STACK_ID_TAG)) != region:
+            # Only classify orphan status when the stack is owned by THIS account AND
+            # region; otherwise we would be listing the wrong account/region's stacks
+            # and could not confirm the stack is gone, so protect it.
+            stack_id = tags.get(CFN_STACK_ID_TAG)
+            if (region_from_stack_id(stack_id) != region
+                    or account_from_stack_id(stack_id) != account_id):
                 skipped_cfn.append(
                     {"region": region, "function": name, "stack": stack_name})
                 continue
@@ -512,6 +536,11 @@ def scan_lambdas_in_region(sub_account_session, region, pattern):
                 except Exception as e:
                     if is_access_denied_error(e):
                         live_stacks_denied = True
+                        print(color(
+                            f"Account: {account_id} | {region}: cloudformation:ListStacks "
+                            f"denied — orphan detection SKIPPED here; CFN-tagged functions "
+                            f"are reported as skipped (not evaluated). Grant "
+                            f"cloudformation:ListStacks to detect orphans.", "yellow"))
                     else:
                         live_stacks_error = str(e)[:150]
             if live_stacks_denied:
@@ -567,8 +596,10 @@ def confirm_deletion(total, account_count, isatty_fn, input_fn):
 
 
 def write_plan_file(results, path):
-    """Write the full delete plan (one 'account | region | function' per line) to
-    path so it can be grepped, diffed, shared, and kept as an audit record."""
+    """Write the full delete plan to path so it can be grepped, diffed, shared, and
+    kept as an audit record. Each line is 'account | region | function', with an
+    optional 4th '| orphaned (...)' field for orphaned functions; splitting on
+    ' | ' and taking field 2 always yields the bare function name."""
     with open(path, "w") as f:
         f.write("\n".join(format_plan_lines(results)) + "\n")
 
