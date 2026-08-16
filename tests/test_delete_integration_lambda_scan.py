@@ -20,31 +20,35 @@ class TestReverifyOrphans(unittest.TestCase):
     def test_orphan_still_gone_is_kept_nonorphan_passthrough(self):
         failed = []
         with patch.object(mod, "list_live_stack_names", return_value={"other"}):
-            kept = mod._reverify_orphans(object(), "111", self._items(), failed)
+            kept, reprotected = mod._reverify_orphans(object(), "111", self._items(), failed)
         self.assertEqual({k["function"] for k in kept}, {"plain", "orph"})
+        self.assertEqual(reprotected, [])
         self.assertEqual(failed, [])
 
-    def test_recreated_stack_orphan_is_dropped_and_failed(self):
+    def test_recreated_stack_orphan_is_reprotected_not_failed(self):
+        # Stack came back -> a correct protection, NOT an operation failure.
         failed = []
         with patch.object(mod, "list_live_stack_names", return_value={"dead"}):
-            kept = mod._reverify_orphans(object(), "111", self._items(), failed)
+            kept, reprotected = mod._reverify_orphans(object(), "111", self._items(), failed)
         self.assertEqual([k["function"] for k in kept], ["plain"])
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["function"], "orph")
+        self.assertEqual([r["function"] for r in reprotected], ["orph"])
+        self.assertEqual(failed, [])            # not a failure -> no non-zero exit
 
-    def test_unverifiable_orphan_is_dropped_and_failed(self):
+    def test_unverifiable_orphan_is_failed_not_reprotected(self):
         failed = []
         with patch.object(mod, "list_live_stack_names", side_effect=RuntimeError("boom")):
-            kept = mod._reverify_orphans(object(), "111", self._items(), failed)
+            kept, reprotected = mod._reverify_orphans(object(), "111", self._items(), failed)
         self.assertEqual([k["function"] for k in kept], ["plain"])
-        self.assertEqual(len(failed), 1)
+        self.assertEqual(reprotected, [])
+        self.assertEqual(len(failed), 1)        # real gap -> drives non-zero exit
 
     def test_no_orphans_returns_items_unchanged_without_listing(self):
         failed = []
         items = [{"account": "111", "name": "a", "region": "us-east-1", "function": "plain"}]
         with patch.object(mod, "list_live_stack_names") as lls:
-            kept = mod._reverify_orphans(object(), "111", items, failed)
+            kept, reprotected = mod._reverify_orphans(object(), "111", items, failed)
         self.assertEqual(kept, items)
+        self.assertEqual(reprotected, [])
         lls.assert_not_called()
 
 

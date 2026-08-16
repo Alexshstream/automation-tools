@@ -131,11 +131,18 @@ def _scan_account_lambdas(sub_account, session, regions, pattern):
 def _reverify_orphans(session, account_id, items, failed):
     """Guard against a scan→delete race: an orphan classified because its stack was
     gone at scan time could have had that stack recreated before this delete phase
-    reached it. Re-list the live stacks (per region) for this account's orphans and
-    drop any whose stack came back, or any we can no longer verify, recording each
-    in `failed` (a real miss that drives a non-zero exit) so it is never deleted.
-    Non-orphan items (no CloudFormation tag) pass through untouched. Returns the
-    list of items that are still safe to delete.
+    reached it. Re-list the live stacks (per region) for this account's orphans and,
+    for each orphan, either keep it (still gone), re-protect it (stack came back), or
+    fail it (couldn't re-verify). Non-orphan items (no CloudFormation tag) pass
+    through untouched.
+
+    Returns (kept, reprotected):
+      - kept:        still safe to delete (stack confirmed still gone) + non-orphans.
+      - reprotected: stack exists again — a CORRECT protection, not an operation
+                     failure, so it is reported as skipped and does NOT drive a
+                     non-zero exit.
+    Orphans we can no longer verify are appended to `failed` (a real gap that drives
+    a non-zero exit) so they are never deleted on an unverified guess.
 
     Relies on the scan-time invariant that an orphan's region equals its stack's
     owning region (scan_lambdas_in_region only classifies an orphan when
@@ -143,17 +150,19 @@ def _reverify_orphans(session, account_id, items, failed):
     checks the correct region."""
     orphan_regions = {it["region"] for it in items if it.get("orphaned_stack")}
     if not orphan_regions:
-        return items
+        return items, []
     live_now = {}
     for rg in orphan_regions:
         try:
             live_now[rg] = list_live_stack_names(session, rg)
         except Exception as e:
-            # Can't re-verify — refuse to delete this region's orphans (safe default).
+            # Can't re-verify — refuse to delete this region's orphans (safe default),
+            # and record them as failed (a real gap), matching the bookkeeping below.
             live_now[rg] = None
             print(color(f"Account: {account_id} | Could not re-list stacks in {rg} to "
-                        f"re-verify orphans; those will be skipped: {e}", "yellow"))
-    kept = []
+                        f"re-verify orphans; those are recorded as failed (not deleted): "
+                        f"{e}", "yellow"))
+    kept, reprotected = [], []
     for it in items:
         stack = it.get("orphaned_stack")
         if not stack:
@@ -165,12 +174,12 @@ def _reverify_orphans(session, account_id, items, failed):
                                           "delete time - not deleted"))
         elif stack in live:
             print(color(f"Account: {account_id} | Stack {stack} exists again - NOT "
-                        f"deleting {it['function']} ({it['region']})", "yellow"))
-            failed.append(dict(it, reason=f"stack {stack} was recreated during the run "
-                                          f"- not deleted"))
+                        f"deleting {it['function']} ({it['region']}) (protected, not a "
+                        f"failure)", "yellow"))
+            reprotected.append(it)
         else:
             kept.append(it)
-    return kept
+    return kept, reprotected
 
 
 def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
@@ -271,7 +280,7 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
         return early
 
     # Delete phase - re-assume roles fresh (the scan can outlive 1h STS creds)
-    deleted, already_gone, failed = [], [], []
+    deleted, already_gone, failed, reprotected = [], [], [], []
     interrupted = False
     by_account = {}
     for d in all_to_delete:
@@ -300,7 +309,8 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
                 # Lambda whose stack came back. Single-threaded, before the pool, and
                 # inside this try so an unexpected error here can't crash the whole
                 # run — the except below records this account's items as failed.
-                items = _reverify_orphans(session, account_id, items, failed)
+                items, reprotected_now = _reverify_orphans(session, account_id, items, failed)
+                reprotected.extend(reprotected_now)
                 if not items:
                     continue
                 # Warm the session's client-creation caches single-threaded; boto3
@@ -354,7 +364,7 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
     # was interrupted before reaching them), so an aborted run isn't mistaken for
     # a completed one.
     attempted = {(x["account"], x["region"], x["function"])
-                 for x in deleted + already_gone + failed}
+                 for x in deleted + already_gone + failed + reprotected}
     not_attempted = [x for x in all_to_delete
                      if (x["account"], x["region"], x["function"]) not in attempted]
     if not_attempted:
@@ -362,8 +372,14 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
                     f"(run interrupted before reaching them); re-run to finish them.",
                     "yellow"))
 
+    if reprotected:
+        print(color(f"{len(reprotected)} planned function(s) were protected at delete "
+                    f"time (their CloudFormation stack was recreated) - not deleted, not "
+                    f"a failure.", "yellow"))
+    # Re-protected functions are now CloudFormation-managed again, so they count as
+    # skipped (not failures) and do not drive a non-zero exit.
     rc = print_lambda_summary(deleted, already_gone, failed + all_scan_errors,
-                              all_skipped, assume_role_failures)
+                              all_skipped + reprotected, assume_role_failures)
     # An interrupted run left work undone — never report it as a clean success.
     return max(rc, 1) if interrupted else rc
 

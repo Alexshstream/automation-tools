@@ -354,19 +354,26 @@ def region_from_stack_id(stack_id):
     return parts[3] or None
 
 
+# Error codes that mean "authorization denied" (permission, SCP, permission
+# boundary). Deliberately excludes transient/credential 403s like ExpiredToken.
+_ACCESS_DENIED_CODES = (
+    "AccessDenied", "AccessDeniedException", "AuthorizationError", "UnauthorizedOperation")
+
+
 def is_access_denied_error(e):
-    """True if the exception is a botocore AccessDenied ClientError. Lets the scan
+    """True if the exception is a botocore authorization-denied ClientError. Lets the scan
     fall back to the pre-orphan-detection behavior (skip CloudFormation-tagged
     functions) when the role simply lacks cloudformation:ListStacks, instead of
     turning every such function into a scan gap and a non-zero exit."""
     response = getattr(e, "response", None)
     if not isinstance(response, dict):
         return False
-    if response.get("Error", {}).get("Code") in ("AccessDenied", "AccessDeniedException"):
-        return True
-    # Catch other authorization denials (SCP / permission-boundary) that surface a
-    # different error code but the same HTTP 403 — still "can't verify", skip clean.
-    return response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 403
+    # Match specific authorization-denial codes only — NOT raw HTTP 403. Transient
+    # credential failures (ExpiredToken/ExpiredTokenException) are also HTTP 403, and
+    # treating those as "role lacks ListStacks" would silently skip CFN-tagged
+    # functions with a clean exit, hiding an incomplete scan. Those must fall through
+    # to the scan-gap path instead.
+    return response.get("Error", {}).get("Code") in _ACCESS_DENIED_CODES
 
 
 def validate_lambda_pattern(pattern):

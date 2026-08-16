@@ -280,12 +280,22 @@ class TestAccessDeniedDetection(unittest.TestCase):
             err = ClientError({"Error": {"Code": code, "Message": "x"}}, "ListStacks")
             self.assertTrue(boto_common.is_access_denied_error(err))
 
-    def test_true_for_other_403_denial(self):
-        # An SCP/permission-boundary denial with a different code but HTTP 403.
-        err = ClientError(
-            {"Error": {"Code": "AuthorizationError", "Message": "x"},
-             "ResponseMetadata": {"HTTPStatusCode": 403}}, "ListStacks")
-        self.assertTrue(boto_common.is_access_denied_error(err))
+    def test_true_for_authorization_denial_codes(self):
+        # SCP / permission-boundary denials surface as these codes.
+        for code in ("AuthorizationError", "UnauthorizedOperation"):
+            err = ClientError(
+                {"Error": {"Code": code, "Message": "x"},
+                 "ResponseMetadata": {"HTTPStatusCode": 403}}, "ListStacks")
+            self.assertTrue(boto_common.is_access_denied_error(err))
+
+    def test_false_for_expired_token_even_though_403(self):
+        # Transient credential expiry is HTTP 403 but must NOT be treated as a
+        # permission denial — it should fall through to the scan-gap path.
+        for code in ("ExpiredToken", "ExpiredTokenException", "RequestExpired"):
+            err = ClientError(
+                {"Error": {"Code": code, "Message": "x"},
+                 "ResponseMetadata": {"HTTPStatusCode": 403}}, "ListStacks")
+            self.assertFalse(boto_common.is_access_denied_error(err))
 
     def test_false_for_other_errors(self):
         throttle = ClientError(
