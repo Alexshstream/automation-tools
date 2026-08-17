@@ -60,13 +60,14 @@ def build_arg_parser():
     # Lambda-only mode
     parser.add_argument(
         "--lambda_name_contains",
-        help="LAMBDA-ONLY MODE: delete only Lambda functions whose name contains this "
-        "string (case-insensitive, min 3 chars). Deletes only functions whose "
-        "CloudFormation stack no longer exists (orphans); functions owned by a live "
-        "stack are skipped. Requires cloudformation:ListStacks in each target account/"
-        "region to detect orphans (without it, all CFN-tagged functions are skipped). "
-        "Does NOT touch CloudFormation stacks or remove the Stream Security integration. "
-        "Mutually exclusive with the stack-only flags.", required=False)
+        help="LAMBDA-ONLY MODE: delete Lambda functions whose name contains this string "
+        "(case-insensitive, min 3 chars). Deletes matching functions that are NOT owned "
+        "by a live CloudFormation stack — i.e. functions with no CloudFormation tag, plus "
+        "orphaned functions whose stack no longer exists; functions owned by a live stack "
+        "are skipped. Requires cloudformation:ListStacks in each target account/region to "
+        "detect orphans (without it, all CFN-tagged functions are skipped). Does NOT touch "
+        "CloudFormation stacks or remove the Stream Security integration. Mutually exclusive "
+        "with the stack-only flags.", required=False)
     return parser
 
 
