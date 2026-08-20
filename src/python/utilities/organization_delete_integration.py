@@ -60,10 +60,14 @@ def build_arg_parser():
     # Lambda-only mode
     parser.add_argument(
         "--lambda_name_contains",
-        help="LAMBDA-ONLY MODE: delete only Lambda functions whose name contains this "
-        "string (case-insensitive, min 3 chars). Does NOT touch CloudFormation stacks and "
-        "does NOT remove the Stream Security integration. Mutually exclusive with the "
-        "stack-only flags.", required=False)
+        help="LAMBDA-ONLY MODE: delete Lambda functions whose name contains this string "
+        "(case-insensitive, min 3 chars). Deletes matching functions that are NOT owned "
+        "by a live CloudFormation stack — i.e. functions with no CloudFormation tag, plus "
+        "orphaned functions whose stack no longer exists; functions owned by a live stack "
+        "are skipped. Requires cloudformation:ListStacks in each target account/region to "
+        "detect orphans (without it, all CFN-tagged functions are skipped). Does NOT touch "
+        "CloudFormation stacks or remove the Stream Security integration. Mutually exclusive "
+        "with the stack-only flags.", required=False)
     return parser
 
 
@@ -96,11 +100,18 @@ def _scan_account_lambdas(sub_account, session, regions, pattern):
             item.update({"account": sub_account[0], "name": sub_account[1]})
 
     # Warm the session's client-creation caches single-threaded; boto3 Session
-    # is not thread-safe for concurrent first-time client creation.
+    # is not thread-safe for concurrent first-time client creation. The region
+    # threads below create both a lambda client (the scan) and a cloudformation
+    # client (the orphan stack-existence check), so warm both services here.
     session.client("lambda", region_name=regions[0])
+    # Also force the cloudformation client AND its list_stacks paginator model to
+    # load single-threaded here — the orphan check calls get_paginator inside the
+    # region threads, and first-loading the paginator config concurrently races.
+    session.client("cloudformation", region_name=regions[0]).get_paginator("list_stacks")
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_to_region = {
-            executor.submit(scan_lambdas_in_region, session, region, pattern): region
+            executor.submit(scan_lambdas_in_region, session, region, pattern,
+                            sub_account[0]): region
             for region in regions}
         for future in concurrent.futures.as_completed(future_to_region):
             region = future_to_region[future]
@@ -120,6 +131,60 @@ def _scan_account_lambdas(sub_account, session, regions, pattern):
             skipped.extend(region_skipped)
             scan_errors.extend(region_errors)
     return to_delete, skipped, scan_errors
+
+
+def _reverify_orphans(session, account_id, items, failed):
+    """Guard against a scan→delete race: an orphan classified because its stack was
+    gone at scan time could have had that stack recreated before this delete phase
+    reached it. Re-list the live stacks (per region) for this account's orphans and,
+    for each orphan, either keep it (still gone), re-protect it (stack came back), or
+    fail it (couldn't re-verify). Non-orphan items (no CloudFormation tag) pass
+    through untouched.
+
+    Returns (kept, reprotected):
+      - kept:        still safe to delete (stack confirmed still gone) + non-orphans.
+      - reprotected: stack exists again — a CORRECT protection, not an operation
+                     failure, so it is reported as skipped and does NOT drive a
+                     non-zero exit.
+    Orphans we can no longer verify are appended to `failed` (a real gap that drives
+    a non-zero exit) so they are never deleted on an unverified guess.
+
+    Relies on the scan-time invariant that an orphan's region AND account equal its
+    stack's owning region/account (scan_lambdas_in_region only classifies an orphan
+    when both the stack-id region and account match the scanned account/region), so
+    re-listing this account's stacks by it["region"] checks the correct place."""
+    orphan_regions = {it["region"] for it in items if it.get("orphaned_stack")}
+    if not orphan_regions:
+        return items, []
+    live_now = {}
+    for rg in orphan_regions:
+        try:
+            live_now[rg] = list_live_stack_names(session, rg)
+        except Exception as e:
+            # Can't re-verify — refuse to delete this region's orphans (safe default),
+            # and record them as failed (a real gap), matching the bookkeeping below.
+            live_now[rg] = None
+            print(color(f"Account: {account_id} | Could not re-list stacks in {rg} to "
+                        f"re-verify orphans; those are recorded as failed (not deleted): "
+                        f"{str(e)[:150]}", "yellow"))
+    kept, reprotected = [], []
+    for it in items:
+        stack = it.get("orphaned_stack")
+        if not stack:
+            kept.append(it)
+            continue
+        live = live_now.get(it["region"])
+        if live is None:
+            failed.append(dict(it, reason="could not re-verify stack still gone at "
+                                          "delete time - not deleted"))
+        elif stack in live:
+            print(color(f"Account: {account_id} | Stack {stack} exists again - NOT "
+                        f"deleting {it['function']} ({it['region']}) (protected, not a "
+                        f"failure)", "yellow"))
+            reprotected.append(it)
+        else:
+            kept.append(it)
+    return kept, reprotected
 
 
 def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
@@ -220,7 +285,7 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
         return early
 
     # Delete phase - re-assume roles fresh (the scan can outlive 1h STS creds)
-    deleted, already_gone, failed = [], [], []
+    deleted, already_gone, failed, reprotected = [], [], [], []
     interrupted = False
     by_account = {}
     for d in all_to_delete:
@@ -243,6 +308,16 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
                                                   f"role: {str(e)[:120]}"))
                 continue
             try:
+                # Re-verify orphans before deleting: a stack could have been
+                # (re)created between the scan and now (the delete phase re-assumes
+                # roles because the scan can outlive 1h STS creds). Never delete a
+                # Lambda whose stack came back. Single-threaded, before the pool, and
+                # inside this try so an unexpected error here can't crash the whole
+                # run — the except below records this account's items as failed.
+                items, reprotected_now = _reverify_orphans(session, account_id, items, failed)
+                reprotected.extend(reprotected_now)
+                if not items:
+                    continue
                 # Warm the session's client-creation caches single-threaded; boto3
                 # Session is not thread-safe for concurrent first-time client creation.
                 session.client("lambda", region_name=items[0]["region"])
@@ -294,7 +369,7 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
     # was interrupted before reaching them), so an aborted run isn't mistaken for
     # a completed one.
     attempted = {(x["account"], x["region"], x["function"])
-                 for x in deleted + already_gone + failed}
+                 for x in deleted + already_gone + failed + reprotected}
     not_attempted = [x for x in all_to_delete
                      if (x["account"], x["region"], x["function"]) not in attempted]
     if not_attempted:
@@ -302,8 +377,14 @@ def _run_lambda_mode(sub_accounts, sts_client, management_account_id, regions,
                     f"(run interrupted before reaching them); re-run to finish them.",
                     "yellow"))
 
+    if reprotected:
+        print(color(f"{len(reprotected)} planned function(s) were protected at delete "
+                    f"time (their CloudFormation stack was recreated) - not deleted, not "
+                    f"a failure.", "yellow"))
+    # Re-protected functions are now CloudFormation-managed again, so they count as
+    # skipped (not failures) and do not drive a non-zero exit.
     rc = print_lambda_summary(deleted, already_gone, failed + all_scan_errors,
-                              all_skipped, assume_role_failures)
+                              all_skipped + reprotected, assume_role_failures)
     # An interrupted run left work undone — never report it as a clean success.
     return max(rc, 1) if interrupted else rc
 
