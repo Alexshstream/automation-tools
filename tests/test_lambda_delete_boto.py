@@ -303,6 +303,16 @@ class TestStackIdRegion(unittest.TestCase):
         self.assertIsNone(boto_common.region_from_stack_id(arn))
         self.assertIsNone(boto_common.account_from_stack_id(arn))
 
+    def test_none_for_cfn_arn_that_is_not_a_stack(self):
+        # Correct service + region + account, but the resource is not a stack (e.g.
+        # a changeSet or a bare non-stack resource). Treat as malformed -> protect.
+        for arn in (
+            "arn:aws:cloudformation:us-east-1:123456789012:not-a-stack",
+            "arn:aws:cloudformation:us-east-1:123456789012:changeSet/cs/uuid",
+        ):
+            self.assertIsNone(boto_common.region_from_stack_id(arn))
+            self.assertIsNone(boto_common.account_from_stack_id(arn))
+
 
 class TestAccessDeniedDetection(unittest.TestCase):
     def test_true_for_access_denied_client_error(self):

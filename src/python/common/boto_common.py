@@ -349,8 +349,11 @@ def _stack_id_parts(stack_id):
     if not stack_id:
         return None
     parts = stack_id.split(":")
-    # arn:aws:cloudformation:<region>:<account>:stack/<name>/<uuid>  -> 6 fields
-    if len(parts) < 6 or parts[0] != "arn" or parts[2] != "cloudformation":
+    # arn:aws:cloudformation:<region>:<account>:stack/<name>/<uuid>  -> 6 fields,
+    # with the resource segment being an actual stack (not e.g. :changeSet/... or a
+    # non-stack resource). Anything else is treated as malformed -> protect.
+    if (len(parts) < 6 or parts[0] != "arn" or parts[2] != "cloudformation"
+            or not parts[5].startswith("stack/")):
         return None
     return parts
 
