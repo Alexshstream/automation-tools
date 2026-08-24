@@ -247,10 +247,17 @@ def integrate_sub_account(
                 f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account,
                 response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
 
-        # Deploying EKS audit logs if enabled
+        # Deploying EKS audit logs if enabled. account_information["cloud_regions"]
+        # is still the backend's stale value from account creation (at most the
+        # session's own region) - deploy_eks_audit_logs_stacks' own auto-detect
+        # fallback would scan only that if given account_information as-is,
+        # silently missing EKS clusters in any other active region.
+        # active_regions (just computed above via real EC2 instance detection
+        # across all candidate regions) is what should be scanned instead.
         if eks_audit_logs:
             deploy_eks_audit_logs_stacks(
-                f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
+                f"https://{environment}.{domain}/graphql", {**account_information, "cloud_regions": active_regions},
+                sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
 
         if not update_regions(graph_client, sub_account, active_regions, not parallel):
             err_msg = f"Account: {sub_account[0]} | Something went wrong with regions update"
