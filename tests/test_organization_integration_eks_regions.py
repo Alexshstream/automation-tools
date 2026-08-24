@@ -139,6 +139,72 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
         mock_eks.assert_called_once()
         self.assertEqual(mock_eks.call_args[0][4], ["eu-west-1"])
 
+    def _run_ready_account(self, potential_regions, registered_cloud_regions,
+                           eks_audit_logs=True, eks_audit_logs_regions=None,
+                           eks_audit_logs_auto_detect=False):
+        sts_client = MagicMock()
+        graph_client = MagicMock()
+        graph_client.get_accounts.return_value = [
+            {"cloud_account_id": "111111111111", "status": "READY",
+             "cloud_regions": registered_cloud_regions,
+             "realtime_regions": [{"region_name": r} for r in registered_cloud_regions],
+             "lightlytics_collection_token": "tok"},
+        ]
+        graph_client.get_account_response_config.return_value = {"remediation": {"status": "done"}}
+
+        session = MagicMock()
+        session.region_name = "us-east-1"
+
+        with patch.object(oi, "boto3") as oi_boto3, \
+                patch.object(oi, "get_active_regions", return_value=potential_regions), \
+                patch.object(oi, "deploy_eks_audit_logs_stacks") as mock_eks, \
+                patch.object(oi, "update_regions", return_value=True), \
+                patch.object(oi, "deploy_all_collection_stacks", return_value=None):
+            oi_boto3.Session.return_value = session
+
+            oi.integrate_sub_account(
+                "https://example.streamsec.io", ("111111111111", "acct"), sts_client, graph_client,
+                ["us-east-1", "us-west-2"], 12345678, None, None, "OrganizationAccountAccessRole",
+                "111111111111",  # org_account_id == sub_account -> no assume_role needed
+                parallel=False, response=False, eks_audit_logs=eks_audit_logs,
+                eks_audit_logs_regions=eks_audit_logs_regions,
+                eks_audit_logs_auto_detect=eks_audit_logs_auto_detect,
+            )
+
+        return mock_eks
+
+    def test_ready_account_auto_detect_uses_potential_regions_not_stale_registered_regions(self):
+        # Already-READY account whose real active AWS regions (potential_regions,
+        # via get_active_regions) have grown since last onboarding -
+        # --eks_audit_logs_auto_detect must scan the fresh set, not the
+        # account's currently-registered (possibly stale) cloud_regions.
+        mock_eks = self._run_ready_account(
+            potential_regions=["us-east-1", "us-west-2"],
+            registered_cloud_regions=["us-east-1"],
+            eks_audit_logs=False, eks_audit_logs_regions=None,
+            eks_audit_logs_auto_detect=True,
+        )
+        mock_eks.assert_called_once()
+        passed_account_information = mock_eks.call_args[0][1]
+        self.assertEqual(
+            sorted(passed_account_information["cloud_regions"]), ["us-east-1", "us-west-2"],
+            "auto-detect must scan potential_regions, not the stale registered cloud_regions")
+        self.assertIsNone(mock_eks.call_args[0][4])
+
+    def test_ready_account_plain_eks_audit_logs_keeps_existing_behavior(self):
+        # Plain --eks_audit_logs (no auto-detect) must keep scanning the
+        # account's registered cloud_regions exactly as before - no behavior
+        # change for anyone already relying on it.
+        mock_eks = self._run_ready_account(
+            potential_regions=["us-east-1", "us-west-2"],
+            registered_cloud_regions=["us-east-1"],
+            eks_audit_logs=True, eks_audit_logs_regions=None,
+            eks_audit_logs_auto_detect=False,
+        )
+        mock_eks.assert_called_once()
+        passed_account_information = mock_eks.call_args[0][1]
+        self.assertEqual(passed_account_information["cloud_regions"], ["us-east-1"])
+
 
 if __name__ == "__main__":
     unittest.main()

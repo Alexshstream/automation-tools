@@ -191,22 +191,35 @@ def integrate_sub_account(
                 if (remediation is None or remediation.get("status") is None) and response:
                     deploy_response_stack(
                         environment_url ,sub_account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=True)
-                
-                # Deploying EKS audit logs if enabled. eks_audit_logs_auto_detect
-                # forces auto-detection (regions=None) regardless of
-                # eks_audit_logs_regions - it's the explicit "just detect
-                # and deploy where EKS clusters are found" mode.
-                if eks_audit_logs or eks_audit_logs_auto_detect:
-                    regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
-                    deploy_eks_audit_logs_stacks(
-                        environment_url, sub_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
-                
+
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
                 if regions_to_integrate:
                     potential_regions = regions_to_integrate
                 else:
                     potential_regions = get_active_regions(sub_account_session, regions)
+
+                # Deploying EKS audit logs if enabled. eks_audit_logs_auto_detect
+                # forces auto-detection (regions=None) regardless of
+                # eks_audit_logs_regions - it's the explicit "just detect and
+                # deploy where EKS clusters are found" mode, so it must scan
+                # potential_regions (real EC2-instance-detected active
+                # regions, just computed above), not
+                # sub_account_information["cloud_regions"] (the account's
+                # currently-registered region list in StreamSecurity, which
+                # may be stale if new regions became active since last
+                # onboarding). Plain --eks_audit_logs keeps its existing
+                # behavior (scanning cloud_regions) unchanged.
+                if eks_audit_logs or eks_audit_logs_auto_detect:
+                    regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
+                    # list(potential_regions): a copy, not a reference - it's
+                    # extended in place further down in this same function.
+                    eks_account_information = (
+                        {**sub_account_information, "cloud_regions": list(potential_regions)}
+                        if eks_audit_logs_auto_detect else sub_account_information)
+                    deploy_eks_audit_logs_stacks(
+                        environment_url, eks_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
+
                 if sorted(current_regions) != sorted(potential_regions):
                     potential_regions.extend(current_regions)
                     potential_regions = list(set(potential_regions))
