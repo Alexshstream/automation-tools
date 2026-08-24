@@ -1,8 +1,8 @@
 import argparse
 import boto3
 import os
-import random
 import sys
+import uuid
 from urllib.parse import urlparse
 
 # Add the project root directory to the Python path
@@ -56,7 +56,10 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         print(color("Warning: --ws_id not set; using the first workspace returned by the API.", "yellow"))
 
     # Setting up variables
-    random_int = random.randint(1000000, 9999999)
+    # A random suffix for this run's stack names, to avoid collisions across
+    # separate runs against the same account/region. A short hex string has
+    # far more entropy than a 7-digit int (~4 billion vs ~9 million).
+    random_int = uuid.uuid4().hex[:8]
     if accounts:
         accounts = accounts.replace(" ", "").split(",")
 

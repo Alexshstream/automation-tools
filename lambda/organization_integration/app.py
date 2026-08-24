@@ -1,7 +1,7 @@
 import boto3
-import random
 import os
 import time
+import uuid
 import concurrent.futures
 from botocore.exceptions import ClientError
 from src.python.common.boto_common import *
@@ -52,7 +52,10 @@ def lambda_handler(event, context):
         eks_audit_logs_regions = eks_audit_logs_regions.split(",")
 
     # Setting up variables
-    random_int = random.randint(1000000, 9999999)
+    # A random suffix for this run's stack names, to avoid collisions across
+    # separate runs against the same account/region. A short hex string has
+    # far more entropy than a 7-digit int (~4 billion vs ~9 million).
+    random_int = uuid.uuid4().hex[:8]
     if accounts:
         accounts = accounts.replace(" ", "").split(",")
 
