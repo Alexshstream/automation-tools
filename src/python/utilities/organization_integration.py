@@ -35,7 +35,7 @@ def _classify_stack_status(status):
 
 
 def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, parallel,
-         ws_id=None, custom_tags=None, regions_to_integrate=None, control_role="OrganizationAccountAccessRole", response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None, api_token=None):
+         ws_id=None, custom_tags=None, regions_to_integrate=None, control_role="OrganizationAccountAccessRole", response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None, eks_audit_logs_auto_detect=False, api_token=None):
 
     try:
         if not environment_url:
@@ -143,7 +143,8 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                 executor.submit(
                     integrate_sub_account,
                     environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
-                    control_role, org_account_id, parallel, response, response_region, response_exclude_runbooks, eks_audit_logs, eks_audit_logs_regions
+                    control_role, org_account_id, parallel, response, response_region, response_exclude_runbooks, eks_audit_logs, eks_audit_logs_regions,
+                    eks_audit_logs_auto_detect
                 ): sub_account for sub_account in sub_accounts
             }
             for future in concurrent.futures.as_completed(future_to_account):
@@ -167,7 +168,8 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                 account_deployed_stacks = integrate_sub_account(
                     environment_url, sub_account, sts_client, graph_client, regions, random_int,
                     custom_tags, regions_to_integrate, control_role, org_account_id, response=response, response_region=response_region, response_exclude_runbooks=response_exclude_runbooks,
-                    eks_audit_logs=eks_audit_logs, eks_audit_logs_regions=eks_audit_logs_regions)
+                    eks_audit_logs=eks_audit_logs, eks_audit_logs_regions=eks_audit_logs_regions,
+                    eks_audit_logs_auto_detect=eks_audit_logs_auto_detect)
                 if account_deployed_stacks:
                     all_deployed_stacks.extend(account_deployed_stacks)
             except Exception as e:
@@ -230,7 +232,8 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
 
 def integrate_sub_account(
         environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate, control_role,
-        org_account_id, parallel=False, response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None):
+        org_account_id, parallel=False, response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None,
+        eks_audit_logs_auto_detect=False):
     print(color(f"Account: {sub_account[0]} | Starting integration", color="blue"))
     deployed_stacks = []
     try:
@@ -274,19 +277,36 @@ def integrate_sub_account(
                     if response_record:
                         deployed_stacks.append(response_record)
 
-                # Deploying EKS audit logs if enabled
-                if eks_audit_logs:
-                    eks_records = deploy_eks_audit_logs_stacks(
-                        environment_url, sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
-                    if eks_records:
-                        deployed_stacks.extend(eks_records)
-                
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
                 if regions_to_integrate:
                     potential_regions = regions_to_integrate
                 else:
                     potential_regions = get_active_regions(sub_account_session, regions)
+
+                # Deploying EKS audit logs if enabled. eks_audit_logs_auto_detect
+                # forces auto-detection (regions=None) regardless of
+                # eks_audit_logs_regions - it's the explicit "just detect and
+                # deploy where EKS clusters are found" mode, so it must scan
+                # potential_regions (real EC2-instance-detected active
+                # regions, just computed above), not
+                # sub_account_information["cloud_regions"] (the account's
+                # currently-registered region list in StreamSecurity, which
+                # may be stale if new regions became active since last
+                # onboarding). Plain --eks_audit_logs keeps its existing
+                # behavior (scanning cloud_regions) unchanged.
+                if eks_audit_logs or eks_audit_logs_auto_detect:
+                    regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
+                    # list(potential_regions): a copy, not a reference - it's
+                    # extended in place further down in this same function.
+                    eks_account_information = (
+                        {**sub_account_information, "cloud_regions": list(potential_regions)}
+                        if eks_audit_logs_auto_detect else sub_account_information)
+                    eks_records = deploy_eks_audit_logs_stacks(
+                        environment_url, eks_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
+                    if eks_records:
+                        deployed_stacks.extend(eks_records)
+
                 if sorted(current_regions) != sorted(potential_regions):
                     potential_regions.extend(current_regions)
                     potential_regions = list(set(potential_regions))
@@ -365,7 +385,7 @@ def integrate_sub_account(
             if response_record:
                 deployed_stacks.append(response_record)
 
-        if eks_audit_logs:
+        if eks_audit_logs or eks_audit_logs_auto_detect:
             # account_information["cloud_regions"] is still the backend's
             # stale value from account creation (at most the CLI's own
             # session region) - deploy_eks_audit_logs_stacks' own auto-detect
@@ -374,9 +394,13 @@ def integrate_sub_account(
             # region. active_regions (just computed above via real EC2
             # instance detection across all candidate regions) is what
             # should be scanned instead.
+            # eks_audit_logs_auto_detect forces auto-detection (regions=None)
+            # regardless of eks_audit_logs_regions - it's the explicit "just
+            # detect and deploy where EKS clusters are found" mode.
+            regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
             eks_records = deploy_eks_audit_logs_stacks(
                 environment_url, {**account_information, "cloud_regions": active_regions},
-                sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
+                sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
             if eks_records:
                 deployed_stacks.extend(eks_records)
 
@@ -475,9 +499,13 @@ if __name__ == "__main__":
         "--eks_audit_logs", help="Enable EKS audit logs", action="store_true", required=False)
     parser.add_argument(
         "--eks_audit_logs_regions", help="Regions for EKS audit logs, separated by comma", required=False)
+    parser.add_argument(
+        "--eks_audit_logs_auto_detect", help="Auto-detect EKS clusters and deploy audit logs only where found",
+        action="store_true", required=False)
     args = parser.parse_args()
     main(args.environment_url, args.environment_user_name, args.environment_password,
          args.aws_profile_name, args.accounts, args.parallel,
          ws_id=args.ws_id, custom_tags=args.custom_tags, regions_to_integrate=args.regions,
          control_role=args.control_role, response=args.response, response_region=args.response_region, response_exclude_runbooks=args.response_exclude_runbooks,
-         eks_audit_logs=args.eks_audit_logs, eks_audit_logs_regions=args.eks_audit_logs_regions, api_token=args.api_token)
+         eks_audit_logs=args.eks_audit_logs, eks_audit_logs_regions=args.eks_audit_logs_regions,
+         eks_audit_logs_auto_detect=args.eks_audit_logs_auto_detect, api_token=args.api_token)
