@@ -28,7 +28,6 @@ def lambda_handler(event, context):
     eks_audit_logs_regions = os.environ.get('EKS_AUDIT_LOGS_REGIONS', None)
     if eks_audit_logs_regions:
         eks_audit_logs_regions = eks_audit_logs_regions.split(",")
-    eks_audit_logs_auto_detect = os.environ.get('EKS_AUDIT_LOGS_AUTO_DETECT', 'false').lower() == 'true'
 
     # Setting up variables
     random_int = random.randint(1000000, 9999999)
@@ -86,7 +85,7 @@ def lambda_handler(event, context):
                     sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
                     control_role, org_account_id, parallel,
                     response, response_region, response_exclude_runbooks, environment, domain,
-                    eks_audit_logs, eks_audit_logs_regions, eks_audit_logs_auto_detect
+                    eks_audit_logs, eks_audit_logs_regions
                 ): sub_account for sub_account in sub_accounts
             }
             for future in concurrent.futures.as_completed(future_to_account):
@@ -102,7 +101,7 @@ def lambda_handler(event, context):
                     sub_account, sts_client, graph_client, regions, random_int,
                     custom_tags, regions_to_integrate, control_role, org_account_id,
                     parallel, response, response_region, response_exclude_runbooks, environment, domain,
-                    eks_audit_logs, eks_audit_logs_regions, eks_audit_logs_auto_detect
+                    eks_audit_logs, eks_audit_logs_regions
                 )
             except Exception as e:
                 failures.append((sub_account[0], str(e)))
@@ -118,7 +117,7 @@ def lambda_handler(event, context):
 def integrate_sub_account(
         sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate, control_role,
         org_account_id, parallel=False, response=False, response_region="us-east-1", response_exclude_runbooks="", environment=None, domain=None,
-        eks_audit_logs=False, eks_audit_logs_regions=None, eks_audit_logs_auto_detect=False):
+        eks_audit_logs=False, eks_audit_logs_regions=None):
     print(color(f"Account: {sub_account[0]} | Starting integration", color="blue"))
     try:
         if sub_account[0] == org_account_id:
@@ -168,34 +167,16 @@ def integrate_sub_account(
                     deploy_response_stack(
                         f"https://{environment}.{domain}/graphql", sub_account_information, sub_account_session, sub_account,
                         response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
+                # Deploying EKS audit logs if enabled
+                if eks_audit_logs:
+                    deploy_eks_audit_logs_stacks(
+                        f"https://{environment}.{domain}/graphql", sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
                 if regions_to_integrate:
                     potential_regions = regions_to_integrate
                 else:
                     potential_regions = get_active_regions(sub_account_session, regions)
-
-                # Deploying EKS audit logs if enabled. eks_audit_logs_auto_detect
-                # forces auto-detection (regions=None) regardless of
-                # eks_audit_logs_regions - it's the explicit "just detect and
-                # deploy where EKS clusters are found" mode, so it must scan
-                # potential_regions (real EC2-instance-detected active
-                # regions, just computed above), not
-                # sub_account_information["cloud_regions"] (the account's
-                # currently-registered region list in StreamSecurity, which
-                # may be stale if new regions became active since last
-                # onboarding). Plain --eks_audit_logs keeps its existing
-                # behavior (scanning cloud_regions) unchanged.
-                if eks_audit_logs or eks_audit_logs_auto_detect:
-                    regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
-                    # list(potential_regions): a copy, not a reference - it's
-                    # extended in place further down in this same function.
-                    eks_account_information = (
-                        {**sub_account_information, "cloud_regions": list(potential_regions)}
-                        if eks_audit_logs_auto_detect else sub_account_information)
-                    deploy_eks_audit_logs_stacks(
-                        f"https://{environment}.{domain}/graphql", eks_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
-
                 if sorted(current_regions) != sorted(potential_regions):
                     potential_regions.extend(current_regions)
                     potential_regions = list(set(potential_regions))
@@ -266,21 +247,10 @@ def integrate_sub_account(
                 f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account,
                 response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
 
-        # Deploying EKS audit logs if enabled. account_information["cloud_regions"]
-        # is still the backend's stale value from account creation (at most the
-        # session's own region) - deploy_eks_audit_logs_stacks' own auto-detect
-        # fallback would scan only that if given account_information as-is,
-        # silently missing EKS clusters in any other active region.
-        # active_regions (just computed above via real EC2 instance detection
-        # across all candidate regions) is what should be scanned instead.
-        if eks_audit_logs or eks_audit_logs_auto_detect:
-            # eks_audit_logs_auto_detect forces auto-detection (regions=None)
-            # regardless of eks_audit_logs_regions - it's the explicit "just
-            # detect and deploy where EKS clusters are found" mode.
-            regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
+        # Deploying EKS audit logs if enabled
+        if eks_audit_logs:
             deploy_eks_audit_logs_stacks(
-                f"https://{environment}.{domain}/graphql", {**account_information, "cloud_regions": active_regions},
-                sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
+                f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
 
         if not update_regions(graph_client, sub_account, active_regions, not parallel):
             err_msg = f"Account: {sub_account[0]} | Something went wrong with regions update"
