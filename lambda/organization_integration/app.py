@@ -8,6 +8,28 @@ from src.python.common.boto_common import *
 from src.python.common.graph_common import GraphCommon
 
 
+def _raise_if_submit_failed(records):
+    """deploy_response_stack/deploy_eks_audit_logs_stacks/
+    deploy_all_collection_stacks now catch a create_stack failure internally
+    and return a SUBMIT_FAILED record instead of raising (so the CLI
+    script's end-of-run sweep can report it). This Lambda entrypoint has no
+    sweep - it signals failure purely by raising - so a submit failure must
+    still fail the invocation the same way an unguarded create_stack
+    exception used to, or it would be silently swallowed (the exact
+    false-success bug this whole change set exists to fix) and the Lambda
+    would report "Integration finished successfully!" despite a stack
+    failing to even submit."""
+    if not records:
+        return
+    if isinstance(records, dict):
+        records = [records]
+    failed = [r for r in records if r and r.get("final_status") == "SUBMIT_FAILED"]
+    if failed:
+        details = "; ".join(
+            f"{r['stack_type']} ({r['region']}): {r.get('status_reason')}" for r in failed)
+        raise Exception(f"Stack submission failed: {details}")
+
+
 def lambda_handler(event, context):
     # Extract parameters from environment variables
     environment = os.environ.get('ENVIRONMENT')
@@ -164,13 +186,13 @@ def integrate_sub_account(
                 # Response stack logic for READY state
                 response_info = graph_client.get_account_response_config(sub_account_information["cloud_account_id"])
                 if (response_info["remediation"] is None or response_info["remediation"]["status"] is None) and response:
-                    deploy_response_stack(
+                    _raise_if_submit_failed(deploy_response_stack(
                         f"https://{environment}.{domain}/graphql", sub_account_information, sub_account_session, sub_account,
-                        response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
+                        response_region, random_int, custom_tags, response_exclude_runbooks, wait=False))
                 # Deploying EKS audit logs if enabled
                 if eks_audit_logs:
-                    deploy_eks_audit_logs_stacks(
-                        f"https://{environment}.{domain}/graphql", sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
+                    _raise_if_submit_failed(deploy_eks_audit_logs_stacks(
+                        f"https://{environment}.{domain}/graphql", sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False))
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
                 if regions_to_integrate:
@@ -197,9 +219,9 @@ def integrate_sub_account(
                 if len(regions_to_integrate) > 0:
                     print(color(f"Account: {sub_account[0]} | Realtime is not enabled on all regions, "
                                 f"adding support for {regions_to_integrate}", "blue"))
-                    deploy_all_collection_stacks(
+                    _raise_if_submit_failed(deploy_all_collection_stacks(
                         regions_to_integrate, sub_account_session, random_int, sub_account_information, sub_account,
-                        custom_tags=custom_tags)
+                        custom_tags=custom_tags))
                 else:
                     print(color(f"Account: {sub_account[0]} | All regions are integrated to realtime", "green"))
                 return
@@ -226,9 +248,10 @@ def integrate_sub_account(
                                if acc["cloud_account_id"] == sub_account[0]][0]
 
         # Deploying the initial integration stack
-        if not deploy_init_stack(
+        ok, _ = deploy_init_stack(
                 account_information, graph_client, sub_account, sub_account_session, random_int, not parallel,
-                custom_tags=custom_tags):
+                custom_tags=custom_tags)
+        if not ok:
             err_msg = f"Account: {sub_account[0]} | Something went wrong with init stack deployment"
             print(color(err_msg, "red"))
             raise Exception(err_msg)
@@ -243,22 +266,22 @@ def integrate_sub_account(
 
         # Response stack logic for new integrations
         if response:
-            deploy_response_stack(
+            _raise_if_submit_failed(deploy_response_stack(
                 f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account,
-                response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
+                response_region, random_int, custom_tags, response_exclude_runbooks, wait=False))
 
         # Deploying EKS audit logs if enabled
         if eks_audit_logs:
-            deploy_eks_audit_logs_stacks(
-                f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
+            _raise_if_submit_failed(deploy_eks_audit_logs_stacks(
+                f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False))
 
         if not update_regions(graph_client, sub_account, active_regions, not parallel):
             err_msg = f"Account: {sub_account[0]} | Something went wrong with regions update"
             print(color(err_msg, "red"))
             raise Exception(err_msg)
 
-        deploy_all_collection_stacks(
-            active_regions, sub_account_session, random_int, account_information, sub_account, custom_tags=custom_tags)
+        _raise_if_submit_failed(deploy_all_collection_stacks(
+            active_regions, sub_account_session, random_int, account_information, sub_account, custom_tags=custom_tags))
 
         return
 

@@ -16,6 +16,24 @@ except ModuleNotFoundError:
     from src.python.common.graph_common import GraphCommon
 
 
+def _classify_stack_status(status):
+    """Bucket a swept stack's final_status for the summary: which counter to
+    increment and which print color to use. Whitelists success rather than
+    blacklisting failure - any terminal status not explicitly recognized as a
+    clean success (an unexpected DELETE_COMPLETE from something external
+    deleting the stack mid-sweep, a not-yet-seen CloudFormation status, the
+    "UNKNOWN" fallback for a record that somehow reached here without a
+    final_status) is reported failed, never silently defaulted to a green
+    "succeeded" line."""
+    if status == "TIMED_OUT":
+        return "timed_out", "yellow"
+    if status == "ERROR":
+        return "errored", "red"
+    if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
+        return "succeeded", "green"
+    return "failed", "red"
+
+
 def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, parallel,
          ws_id=None, custom_tags=None, regions_to_integrate=None, control_role="OrganizationAccountAccessRole", response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None, api_token=None):
 
@@ -112,6 +130,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         return
 
     failures = []
+    all_deployed_stacks = []
     if parallel:
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
             # `parallel` is passed positionally on purpose: integrate_sub_account uses
@@ -128,25 +147,83 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                 sub_account = future_to_account[future]
                 account_id = sub_account[0]
                 try:
-                    future.result()
+                    account_deployed_stacks = future.result()
+                    if account_deployed_stacks:
+                        all_deployed_stacks.extend(account_deployed_stacks)
                 except Exception as e:
                     failures.append((account_id, str(e)))
+                    # Even though this account's run raised, it may have already
+                    # created some real stacks before the failure (e.g. the init
+                    # stack succeeded, then a later step raised) - preserve those
+                    # so they still get swept/reported instead of silently lost.
+                    all_deployed_stacks.extend(getattr(e, "deployed_stacks", None) or [])
     else:
         for sub_account in sub_accounts:
             account_id = sub_account[0]
             try:
-                integrate_sub_account(
+                account_deployed_stacks = integrate_sub_account(
                     environment_url, sub_account, sts_client, graph_client, regions, random_int,
                     custom_tags, regions_to_integrate, control_role, org_account_id, response=response, response_region=response_region, response_exclude_runbooks=response_exclude_runbooks,
                     eks_audit_logs=eks_audit_logs, eks_audit_logs_regions=eks_audit_logs_regions)
+                if account_deployed_stacks:
+                    all_deployed_stacks.extend(account_deployed_stacks)
             except Exception as e:
                 failures.append((account_id, str(e)))
+                all_deployed_stacks.extend(getattr(e, "deployed_stacks", None) or [])
 
     if failures:
         print(color(f"Integration finished with {len(failures)} failure(s):", "red"))
         for account_id, msg in failures:
             print(color(f"  {account_id}: {msg}", "red"))
-    else:
+
+    # Every create_stack call above was fire-and-forget (submitted, not waited on).
+    # Sweep every stack this run created to find out what actually happened, then
+    # print one consolidated, honest summary instead of assuming success.
+    if all_deployed_stacks:
+        print(color(
+            f"Sweeping final status of {len(all_deployed_stacks)} stack(s) deployed this run "
+            f"(polling CloudFormation, this can take a few minutes)...", "blue"))
+        swept_stacks = sweep_stack_statuses(
+            all_deployed_stacks, sts_client, org_account_id, control_role=control_role)
+
+        counts = {"succeeded": 0, "failed": 0, "timed_out": 0, "errored": 0}
+        for r in swept_stacks:
+            # Defensive .get() with a fallback, not direct indexing: every
+            # record reaching here is SUPPOSED to carry a final_status (either
+            # set directly for a submit-time failure, or guaranteed by
+            # sweep_stack_statuses/_sweep_account otherwise), but that
+            # invariant is enforced only by convention across several
+            # functions - a future change that violates it should degrade to
+            # an honest "unknown, check manually" line instead of crashing
+            # this loop and losing every other account's already-printed
+            # results.
+            status = r.get("final_status") or "UNKNOWN"
+            reason = r.get("status_reason")
+            line = f"{r['account']} ({r['name']}) | {r['region']} | {r['stack_type']} | {status}"
+            if reason:
+                line += f" | reason: {reason}"
+            bucket, print_color = _classify_stack_status(status)
+            counts[bucket] += 1
+            print(color(line, print_color))
+
+        succeeded_count = counts["succeeded"]
+        failed_count = counts["failed"]
+        timed_out_count = counts["timed_out"]
+        errored_count = counts["errored"]
+
+        summary = (
+            f"Stack sweep summary ({len(swept_stacks)} stack(s) total): "
+            f"{succeeded_count} succeeded, {failed_count} failed, "
+            f"{timed_out_count} timed out, {errored_count} errored")
+        if failed_count or errored_count:
+            print(color(summary, "red"))
+        elif timed_out_count:
+            print(color(summary, "yellow"))
+        else:
+            print(color(summary, "green"))
+    elif not failures:
+        # Nothing new was deployed this run (e.g. every targeted account was
+        # already fully READY in every region) - there is nothing to sweep.
         print(color("Integration finished successfully!", "green"))
 
 
@@ -154,6 +231,7 @@ def integrate_sub_account(
         environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate, control_role,
         org_account_id, parallel=False, response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None):
     print(color(f"Account: {sub_account[0]} | Starting integration", color="blue"))
+    deployed_stacks = []
     try:
         if sub_account[0] == org_account_id:
             sub_account_session = boto3.Session()
@@ -182,17 +260,25 @@ def integrate_sub_account(
             elif sub_account_information["status"] == "READY":
                 print(color(f"Account: {sub_account[0]} | Integration exists and in READY state", "green"))
                 
-                # Deploying response stack if enabled
+                # Deploying response stack if enabled. wait=False here (this
+                # branch used to pass wait=True) - matches the fire-and-forget
+                # pattern every other deploy call in this file already uses;
+                # the end-of-run sweep determines the real outcome instead of
+                # blocking here.
                 response_info = graph_client.get_account_response_config(sub_account_information["cloud_account_id"])
                 remediation = response_info.get("remediation")
                 if (remediation is None or remediation.get("status") is None) and response:
-                    deploy_response_stack(
-                        environment_url ,sub_account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=True)
-                
+                    response_record = deploy_response_stack(
+                        environment_url ,sub_account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
+                    if response_record:
+                        deployed_stacks.append(response_record)
+
                 # Deploying EKS audit logs if enabled
                 if eks_audit_logs:
-                    deploy_eks_audit_logs_stacks(
+                    eks_records = deploy_eks_audit_logs_stacks(
                         environment_url, sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
+                    if eks_records:
+                        deployed_stacks.extend(eks_records)
                 
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
@@ -220,12 +306,14 @@ def integrate_sub_account(
                 if len(regions_to_integrate) > 0:
                     print(color(f"Account: {sub_account[0]} | Realtime is not enabled on all regions, "
                                 f"adding support for {regions_to_integrate}", "blue"))
-                    deploy_all_collection_stacks(
+                    collection_records = deploy_all_collection_stacks(
                         regions_to_integrate, sub_account_session, random_int, sub_account_information, sub_account,
                         custom_tags=custom_tags)
+                    if collection_records:
+                        deployed_stacks.extend(collection_records)
                 else:
                     print(color(f"Account: {sub_account[0]} | All regions are integrated to realtime", "green"))
-                return
+                return deployed_stacks
             else:
                 err_msg = f"Account: {sub_account[0]} | Account is in {sub_account_information['status']} " \
                           f"status at StreamSecurity, remove it and try again"
@@ -249,10 +337,16 @@ def integrate_sub_account(
                                if acc["cloud_account_id"] == sub_account[0]][0]
 
         # Deploying the initial integration stack
-        if not deploy_init_stack(
+        init_ok, init_record = deploy_init_stack(
                 account_information, graph_client, sub_account, sub_account_session, random_int, not parallel,
-                custom_tags=custom_tags):
+                custom_tags=custom_tags)
+        if init_record:
+            deployed_stacks.append(init_record)
+        if not init_ok:
+            reason = init_record.get("status_reason") if init_record else None
             err_msg = f"Account: {sub_account[0]} | Something went wrong with init stack deployment"
+            if reason:
+                err_msg += f": {reason}"
             print(color(err_msg, "red"))
             raise Exception(err_msg)
 
@@ -265,12 +359,16 @@ def integrate_sub_account(
         print(color(f"Account: {sub_account[0]} | Active regions are: {active_regions}", "blue"))
 
         if response:
-            deploy_response_stack(
+            response_record = deploy_response_stack(
                 environment_url, account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
+            if response_record:
+                deployed_stacks.append(response_record)
 
         if eks_audit_logs:
-            deploy_eks_audit_logs_stacks(
+            eks_records = deploy_eks_audit_logs_stacks(
                 environment_url, account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False)
+            if eks_records:
+                deployed_stacks.extend(eks_records)
 
         # Updating the regions in StreamSecurity and waiting
         if not update_regions(graph_client, sub_account, active_regions, not parallel):
@@ -279,15 +377,22 @@ def integrate_sub_account(
             raise Exception(err_msg)
 
         # Deploying collections stacks for all regions
-        deploy_all_collection_stacks(
+        collection_records = deploy_all_collection_stacks(
             active_regions, sub_account_session, random_int, account_information, sub_account, custom_tags=custom_tags)
+        if collection_records:
+            deployed_stacks.extend(collection_records)
 
-        return
+        return deployed_stacks
 
     except Exception as e:
         err_msg = f"Account: {sub_account[0]} | Something went wrong: {e}"
         print(color(err_msg, "red"))
-        raise Exception(err_msg)
+        wrapped = Exception(err_msg)
+        # Preserve whatever stacks were already created before this failure (e.g.
+        # the init stack succeeded but a later step raised) so main() can still
+        # sweep/report them instead of silently losing track of real AWS resources.
+        wrapped.deployed_stacks = deployed_stacks
+        raise wrapped
 
 
 def update_regions(graph_client, sub_account, active_regions, wait=True):
