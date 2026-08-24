@@ -18,7 +18,9 @@ from src.python.utilities import organization_integration as oi
 
 
 class TestEksAuditLogsActiveRegions(unittest.TestCase):
-    def _run_brand_new_account(self, active_regions, backend_cloud_regions):
+    def _run_brand_new_account(self, active_regions, backend_cloud_regions,
+                               eks_audit_logs=True, eks_audit_logs_regions=None,
+                               eks_audit_logs_auto_detect=False):
         sts_client = MagicMock()
         graph_client = MagicMock()
         # First get_accounts() call (existence check) -> IndexError, so
@@ -48,7 +50,9 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
                 "https://example.streamsec.io", ("111111111111", "acct"), sts_client, graph_client,
                 ["us-east-1", "us-west-2"], 12345678, None, None, "OrganizationAccountAccessRole",
                 "111111111111",  # org_account_id == sub_account -> no assume_role needed
-                parallel=False, response=False, eks_audit_logs=True, eks_audit_logs_regions=None,
+                parallel=False, response=False, eks_audit_logs=eks_audit_logs,
+                eks_audit_logs_regions=eks_audit_logs_regions,
+                eks_audit_logs_auto_detect=eks_audit_logs_auto_detect,
             )
 
         return mock_eks
@@ -83,6 +87,57 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
         passed_account_information = mock_eks.call_args[0][1]
         self.assertEqual(passed_account_information["lightlytics_collection_token"], "tok")
         self.assertEqual(passed_account_information["cloud_account_id"], "111111111111")
+
+    def test_auto_detect_flag_alone_triggers_deploy_with_active_regions(self):
+        # --eks_audit_logs_auto_detect on its own (no --eks_audit_logs) must
+        # still trigger detection+deploy, scanning active_regions.
+        mock_eks = self._run_brand_new_account(
+            active_regions=["us-east-1", "us-west-2"],
+            backend_cloud_regions=["us-east-1"],
+            eks_audit_logs=False, eks_audit_logs_regions=None,
+            eks_audit_logs_auto_detect=True,
+        )
+        mock_eks.assert_called_once()
+        passed_account_information = mock_eks.call_args[0][1]
+        self.assertEqual(
+            sorted(passed_account_information["cloud_regions"]), ["us-east-1", "us-west-2"])
+        # regions_arg (5th positional) must be None so
+        # deploy_eks_audit_logs_stacks runs its own auto-detection.
+        self.assertIsNone(mock_eks.call_args[0][4])
+
+    def test_auto_detect_flag_overrides_explicit_regions(self):
+        # If both --eks_audit_logs_regions and --eks_audit_logs_auto_detect
+        # are passed, auto-detect wins - the explicit region list is ignored
+        # in favor of real detection.
+        mock_eks = self._run_brand_new_account(
+            active_regions=["us-east-1", "us-west-2"],
+            backend_cloud_regions=["us-east-1"],
+            eks_audit_logs=True, eks_audit_logs_regions=["eu-west-1"],
+            eks_audit_logs_auto_detect=True,
+        )
+        mock_eks.assert_called_once()
+        self.assertIsNone(mock_eks.call_args[0][4])
+
+    def test_neither_flag_skips_eks_entirely(self):
+        mock_eks = self._run_brand_new_account(
+            active_regions=["us-east-1", "us-west-2"],
+            backend_cloud_regions=["us-east-1"],
+            eks_audit_logs=False, eks_audit_logs_regions=None,
+            eks_audit_logs_auto_detect=False,
+        )
+        mock_eks.assert_not_called()
+
+    def test_explicit_eks_audit_logs_regions_still_respected_without_auto_detect(self):
+        # Existing behavior preserved: --eks_audit_logs_regions still passes
+        # through untouched when --eks_audit_logs_auto_detect isn't set.
+        mock_eks = self._run_brand_new_account(
+            active_regions=["us-east-1", "us-west-2"],
+            backend_cloud_regions=["us-east-1"],
+            eks_audit_logs=True, eks_audit_logs_regions=["eu-west-1"],
+            eks_audit_logs_auto_detect=False,
+        )
+        mock_eks.assert_called_once()
+        self.assertEqual(mock_eks.call_args[0][4], ["eu-west-1"])
 
 
 if __name__ == "__main__":
