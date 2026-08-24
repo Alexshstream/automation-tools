@@ -40,7 +40,7 @@ sub_account_information = {
 print("=" * 70)
 print(f"Candidate regions given to auto-detection: {CANDIDATE_REGIONS}")
 print("=" * 70)
-print("STEP 1: submitting stacks for whatever regions have EKS clusters")
+print("STEP 1: Submitting stacks for detected EKS regions")
 print("=" * 70)
 records = deploy_eks_audit_logs_stacks(
     environment_url="https://test.streamsec.io",
@@ -61,7 +61,7 @@ if not records:
 else:
     print()
     print("=" * 70)
-    print("STEP 2: checking what actually happened")
+    print("STEP 2: Verifying final stack status")
     print("=" * 70)
     sts_client = session.client('sts')
     swept = sweep_stack_statuses(
