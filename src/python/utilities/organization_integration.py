@@ -394,11 +394,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eks_audit_logs_regions", help="Regions for EKS audit logs, separated by comma", required=False)
     parser.add_argument(
-        "--eks_audit_logs_auto_detect",
-        help="Auto-detect active EKS regions per account (based on real EC2-instance-detected active "
-             "regions) and deploy the EKS audit-log stack only where clusters are actually found. "
-             "Independent of --eks_audit_logs/--eks_audit_logs_regions; overrides --eks_audit_logs_regions "
-             "if both are passed.",
+        "--eks_audit_logs_auto_detect", help="Auto-detect EKS clusters and deploy audit logs only where found",
         action="store_true", required=False)
     args = parser.parse_args()
     main(args.environment_url, args.environment_user_name, args.environment_password,
