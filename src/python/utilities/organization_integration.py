@@ -180,9 +180,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
     # Sweep every stack this run created to find out what actually happened, then
     # print one consolidated, honest summary instead of assuming success.
     if all_deployed_stacks:
-        print(color(
-            f"Sweeping final status of {len(all_deployed_stacks)} stack(s) deployed this run "
-            f"(polling CloudFormation, this can take a few minutes)...", "blue"))
+        print(color(f"Checking final status of {len(all_deployed_stacks)} stack(s)...", "blue"))
         swept_stacks = sweep_stack_statuses(
             all_deployed_stacks, sts_client, org_account_id, control_role=control_role)
 

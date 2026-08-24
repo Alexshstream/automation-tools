@@ -380,8 +380,7 @@ def deploy_init_stack(account_information, graph_client, sub_account, sub_accoun
             cf_confirmed = wait_for_cloudformation(sub_account, sub_account_stack_id, cf)
             if not cf_confirmed:
                 print(color(f"Account: {sub_account[0]} | Init stack did not confirm completion "
-                            f"within the wait timeout - checking account connection status anyway",
-                            "yellow"))
+                            f"within the wait timeout, checking account status", "yellow"))
 
             print(color(f"Account: {sub_account[0]} | "
                         f"Waiting for the account to finish integrating with Lightlytics", "blue"))
@@ -419,8 +418,7 @@ def deploy_init_stack(account_information, graph_client, sub_account, sub_accoun
         # known yet here - claiming success now would repeat the exact false-
         # success pattern this change set exists to fix. The record above is
         # tracked and its real status is determined by the end-of-run sweep.
-        print(color(f"Account: {sub_account[0]} | Init stack submitted, status will be "
-                    f"confirmed by the end-of-run sweep", "blue"))
+        print(color(f"Account: {sub_account[0]} | Init stack submitted, final status pending", "blue"))
     return True, record
 
 

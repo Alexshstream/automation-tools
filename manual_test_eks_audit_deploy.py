@@ -23,10 +23,11 @@ import boto3
 sys.path.insert(0, '.')
 from src.python.common.boto_common import deploy_eks_audit_logs_stacks, sweep_stack_statuses
 
-# Broad candidate list: us-east-1 and us-west-2 have EKS clusters (should be
-# detected and deployed-to/skipped-as-already-covered); us-east-2 and
-# eu-west-1 have none (should be silently excluded by detection).
-CANDIDATE_REGIONS = ["us-east-1", "us-west-2", "us-east-2", "eu-west-1"]
+# 5 candidate regions, 2 of which have EKS clusters (us-east-1, us-west-2 -
+# should be detected and deployed-to/skipped-as-already-covered); the other
+# 3 (us-east-2, eu-west-1, eu-central-1) have none and should be silently
+# excluded by detection.
+CANDIDATE_REGIONS = ["us-east-1", "us-west-2", "us-east-2", "eu-west-1", "eu-central-1"]
 
 session = boto3.Session()
 account_id = session.client('sts').get_caller_identity()['Account']
@@ -48,7 +49,7 @@ records = deploy_eks_audit_logs_stacks(
     sub_account_session=session,
     sub_account=sub_account,
     eks_audit_logs_regions=None,
-    random_int=666666,
+    random_int=555555,
     custom_tags=None,
     wait=False,
 )
