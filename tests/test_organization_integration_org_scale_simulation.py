@@ -48,9 +48,11 @@ SCENARIOS = {
                      "has_eks": True, "eks_get_function_throttled": True},
     "100000000008": {"desc": "EKS: lambda already exists, should skip",
                      "has_eks": True, "eks_lambda_already_exists": True},
-    "100000000009": {"desc": "already READY, needs a new region added",
+    "100000000009": {"desc": "already READY, needs a new region added, has EKS "
+                             "in the not-yet-registered region",
                      "status": "READY", "in_registry": True,
-                     "cloud_regions": ["us-east-1"], "realtime_regions": ["us-east-1"]},
+                     "cloud_regions": ["us-east-1"], "realtime_regions": ["us-east-1"],
+                     "has_eks": True},
     "100000000010": {"desc": "already READY, fully quiescent, nothing to do",
                      "status": "READY", "in_registry": True,
                      # Matches exactly what get_active_regions() will compute
@@ -336,7 +338,7 @@ class TestOrgScaleSimulation(unittest.TestCase):
                 ll_username=None, ll_password=None, aws_profile_name=None,
                 accounts=",".join(SCENARIOS.keys()), parallel=None,
                 ws_id="ws-1", api_token="fake-token",
-                response=True, eks_audit_logs=True,
+                response=True, eks_audit_logs_auto_detect=True,
             )
 
         output = stdout_buf.getvalue()
@@ -422,11 +424,19 @@ class TestOrgScaleSimulation(unittest.TestCase):
             [r for r in by_account.get("100000000008", []) if r["stack_type"] == "eks_audit"],
             "lambda-already-exists EKS region should produce no stack record")
 
-        # 9: already READY, region set changed - no init stack (already
-        # integrated), only the new region's collection stack.
+        # 9: already READY, region set changed, has EKS - no init stack
+        # (already integrated), the new region's collection stack, and
+        # (regression check for the READY-account potential_regions fix)
+        # an eks_audit stack in us-west-2 - a region NOT in this account's
+        # registered cloud_regions (["us-east-1"]) but which is real and
+        # active per get_active_regions(). Under the old --eks_audit_logs
+        # flag this would have been missed entirely (it only scans
+        # cloud_regions); --eks_audit_logs_auto_detect must catch it.
         self.assertNotIn("100000000009", failed_accounts)
         self.assertEqual(stacks_of("100000000009"), [
             ("collection", "us-west-2", "CREATE_COMPLETE"),
+            ("eks_audit", "us-east-1", "CREATE_COMPLETE"),
+            ("eks_audit", "us-west-2", "CREATE_COMPLETE"),
             ("response", "us-east-1", "CREATE_COMPLETE"),
         ])
 
