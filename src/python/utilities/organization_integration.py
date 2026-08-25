@@ -293,7 +293,16 @@ def integrate_sub_account(
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
                 if regions_to_integrate:
-                    potential_regions = regions_to_integrate
+                    # list(...): a copy, not the caller's shared --regions
+                    # list itself - it gets extend()'d in place further down
+                    # in this same branch. regions_to_integrate is the SAME
+                    # object passed to every account in this run (and, under
+                    # --parallel, to every account's thread concurrently) -
+                    # mutating it directly would leak one account's
+                    # current_regions into every other account's region set
+                    # processed afterward, and race across threads in
+                    # parallel mode.
+                    potential_regions = list(regions_to_integrate)
                 else:
                     potential_regions = get_active_regions(sub_account_session, regions)
 
@@ -301,19 +310,25 @@ def integrate_sub_account(
                 # forces auto-detection (regions=None) regardless of
                 # eks_audit_logs_regions - it's the explicit "just detect and
                 # deploy where EKS clusters are found" mode, so it must scan
-                # potential_regions (real EC2-instance-detected active
-                # regions, just computed above), not
-                # sub_account_information["cloud_regions"] (the account's
-                # currently-registered region list in StreamSecurity, which
-                # may be stale if new regions became active since last
-                # onboarding). Plain --eks_audit_logs keeps its existing
-                # behavior (scanning cloud_regions) unchanged.
+                # the union of potential_regions (real EC2-instance-detected
+                # active regions, just computed above) AND current_regions
+                # (the account's already-registered regions). potential_regions
+                # alone would be narrower than plain --eks_audit_logs' own
+                # cloud_regions-based scan for a Fargate-only EKS cluster (no
+                # EC2 instances, so get_active_regions never reports that
+                # region as active) or any registered region with no
+                # currently-running instances - both real, both must still be
+                # scanned. sub_account_information["cloud_regions"] itself
+                # isn't used directly since it may be stale relative to
+                # current_regions if this account's info was fetched earlier
+                # in the run; current_regions is read fresh, right above.
+                # Plain --eks_audit_logs keeps its existing behavior
+                # (scanning cloud_regions only) unchanged.
                 if eks_audit_logs or eks_audit_logs_auto_detect:
                     regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
-                    # list(potential_regions): a copy, not a reference - it's
-                    # extended in place further down in this same function.
+                    eks_scan_regions = sorted(set(potential_regions) | set(current_regions))
                     eks_account_information = (
-                        {**sub_account_information, "cloud_regions": list(potential_regions)}
+                        {**sub_account_information, "cloud_regions": eks_scan_regions}
                         if eks_audit_logs_auto_detect else sub_account_information)
                     eks_records = deploy_eks_audit_logs_stacks(
                         environment_url, eks_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False,

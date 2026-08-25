@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sys
 import unittest
@@ -98,6 +99,54 @@ class TestSweepStackStatuses(unittest.TestCase):
         # CloudFormation failure or success status.
         self.assertNotIn("FAILED", result[0]["final_status"])
         self.assertNotIn("COMPLETE", result[0]["final_status"])
+
+    def test_deadline_reached_but_targeted_lookup_finds_a_real_deleted_stack(self):
+        # A real, unfiltered describe_stacks() never returns a stack that's
+        # reached DELETE_COMPLETE - so a stack that rolled back and was
+        # deleted would be invisible to every batched tick above and, before
+        # this fix, would be misreported as "still in progress, check
+        # manually" (TIMED_OUT) instead of its real, genuinely terminal
+        # status. One final targeted lookup by stack_id at the deadline
+        # finds it (a targeted DescribeStacks-by-ID still returns deleted
+        # stacks).
+        client = MagicMock()
+
+        def describe_stacks(**kwargs):
+            if "StackName" in kwargs:
+                return {"Stacks": [{"StackId": "sid-1", "StackStatus": "DELETE_COMPLETE",
+                                    "StackStatusReason": "rolled back"}]}
+            return {"Stacks": []}  # unfiltered batch query never sees the deleted stack
+        client.describe_stacks.side_effect = describe_stacks
+        record = self._record("111", "us-east-1", "sid-1")
+
+        with self._mgmt_session_patch(client):
+            result = boto_common.sweep_stack_statuses(
+                [record], sts_client=MagicMock(), management_account_id="111",
+                poll_interval=0, timeout=-1)
+
+        self.assertEqual(result[0]["final_status"], "DELETE_COMPLETE")
+        self.assertEqual(result[0]["status_reason"], "rolled back")
+
+    def test_targeted_lookup_failure_at_deadline_still_falls_through_to_timed_out(self):
+        # The final targeted lookup is best-effort - if it ALSO fails (e.g.
+        # throttling, or the stack aged out of CloudFormation's short
+        # retention for deleted stacks), the record must still land in the
+        # honest TIMED_OUT bucket, not crash the sweep or silently vanish.
+        client = MagicMock()
+
+        def describe_stacks(**kwargs):
+            if "StackName" in kwargs:
+                raise Exception("simulated failure on targeted lookup")
+            return {"Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_IN_PROGRESS"}]}
+        client.describe_stacks.side_effect = describe_stacks
+        record = self._record("111", "us-east-1", "sid-1")
+
+        with self._mgmt_session_patch(client):
+            result = boto_common.sweep_stack_statuses(
+                [record], sts_client=MagicMock(), management_account_id="111",
+                poll_interval=0, timeout=-1)
+
+        self.assertEqual(result[0]["final_status"], "TIMED_OUT")
 
     def test_deadline_is_computed_fresh_when_this_accounts_worker_actually_starts(self):
         # Regression test for the large-org false-timeout bug: the deadline
@@ -564,6 +613,66 @@ class TestSweepStackStatuses(unittest.TestCase):
         self.assertEqual(result[0]["final_status"], "SUBMIT_FAILED")
         self.assertEqual(result[0]["status_reason"], "create_stack raised")
         client.describe_stacks.assert_not_called()
+
+
+class TestWaitForCloudformation(unittest.TestCase):
+    """wait_for_cloudformation is the legacy synchronous single-stack wait
+    (used for the init stack when wait=True, i.e. the default non-parallel
+    path) - distinct from the sweep's own describe_stacks polling, which
+    already handles pagination. This used to call the unpaginated,
+    unfiltered list_stacks() and index [0] into the filtered result - in a
+    busy account with enough other stacks that this one landed past page 1,
+    that raised IndexError, which the caller (deploy_init_stack) converts
+    into a false stack-deployment failure for a stack that was actually
+    fine. describe_stacks(StackName=cft_id) targets the one stack directly,
+    with no pagination hazard at all."""
+
+    def test_targets_the_stack_directly_by_id_not_an_unfiltered_list(self):
+        client = MagicMock()
+        client.describe_stacks.return_value = {
+            "Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_COMPLETE"}]}
+
+        with patch.object(boto_common.time, "sleep"):
+            result = boto_common.wait_for_cloudformation(("111", "acct"), "sid-1", client)
+
+        self.assertTrue(result)
+        client.describe_stacks.assert_called_once_with(StackName="sid-1")
+        client.list_stacks.assert_not_called()
+
+    def test_unaffected_by_how_many_other_stacks_exist_in_the_account(self):
+        # The whole point of switching to a targeted, by-ID lookup: unlike
+        # an unpaginated list_stacks() call, this never needs to see (or
+        # care about) any other stack in the account at all.
+        client = MagicMock()
+        client.describe_stacks.return_value = {
+            "Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_COMPLETE"}]}
+
+        with patch.object(boto_common.time, "sleep"):
+            result = boto_common.wait_for_cloudformation(("111", "acct"), "sid-1", client)
+
+        self.assertTrue(result)
+
+    def test_rollback_in_progress_still_raises(self):
+        client = MagicMock()
+        client.describe_stacks.return_value = {
+            "Stacks": [{"StackId": "sid-1", "StackStatus": "ROLLBACK_IN_PROGRESS"}]}
+
+        with patch.object(boto_common.time, "sleep"):
+            with self.assertRaises(Exception):
+                boto_common.wait_for_cloudformation(("111", "acct"), "sid-1", client)
+
+    def test_timeout_returns_false_not_an_exception(self):
+        client = MagicMock()
+        client.describe_stacks.return_value = {
+            "Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_IN_PROGRESS"}]}
+
+        # Negative timeout -> the loop condition (dt_diff < timeout) is
+        # already false after the mandatory first check, so this resolves
+        # deterministically without a real clock wait.
+        with patch.object(boto_common.time, "sleep"):
+            result = boto_common.wait_for_cloudformation(("111", "acct"), "sid-1", client, timeout=-1)
+
+        self.assertFalse(result)
 
 
 class TestDeployInitStackReturnShape(unittest.TestCase):
@@ -1054,6 +1163,76 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
         eks_client_west.list_clusters.assert_called_once()  # eu-west-1 WAS scanned, just excluded
 
 
+def _load_lambda_app_module():
+    """Load lambda/organization_integration/app.py directly via importlib, since
+    'lambda' is a reserved keyword and cannot appear in a normal import
+    statement. Assumes the repo root is already on sys.path (added above) so
+    app.py's own `from src.python...` imports resolve."""
+    app_path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), '..', 'lambda', 'organization_integration', 'app.py'))
+    spec = importlib.util.spec_from_file_location(
+        'organization_integration_lambda_app', app_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestLambdaAppDeployInitStackCallSite(unittest.TestCase):
+    """Regression coverage for the one-line fix in lambda/organization_integration/
+    app.py: `deploy_init_stack` now returns (ok, record) instead of a bare bool,
+    and the call site must unpack it while preserving the existing
+    if-not-ok control flow exactly. Without this fix, `if not deploy_init_stack(...)`
+    is always False (a non-empty tuple is always truthy) - the Lambda would
+    never detect a real init-stack failure and would proceed against a dead
+    account."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _load_lambda_app_module()
+
+    def _run(self, deploy_init_stack_return):
+        app = self.app
+        sub_account = ("123456789012", "acct-name")
+        org_account_id = "123456789012"  # same as sub_account -> no assume-role needed
+        sts_client = MagicMock()
+        graph_client = MagicMock()
+        # First get_accounts() call: no existing integration -> IndexError -> pass.
+        # Second get_accounts() call: used to fetch account_information.
+        graph_client.get_accounts.side_effect = [
+            [],
+            [{"cloud_account_id": sub_account[0]}],
+        ]
+        graph_client.create_account.return_value = True
+
+        session = MagicMock()
+        session.region_name = "us-east-1"
+
+        with patch.object(app, "boto3") as boto3_mock, \
+                patch.object(app, "deploy_init_stack", return_value=deploy_init_stack_return) as dis, \
+                patch.object(app, "get_active_regions", return_value=["us-east-1"]), \
+                patch.object(app, "update_regions", return_value=True), \
+                patch.object(app, "deploy_all_collection_stacks", return_value=None):
+            boto3_mock.Session.return_value = session
+            app.integrate_sub_account(
+                sub_account, sts_client, graph_client, ["us-east-1"], 42,
+                None, None, "OrganizationAccountAccessRole", org_account_id,
+                environment="env", domain="streamsec.io")
+        dis.assert_called_once()
+
+    def test_ok_true_does_not_crash_and_continues(self):
+        # Must not raise - the new (ok, record) tuple is unpacked correctly and
+        # the existing "if not ok: raise" control flow allows the run to proceed.
+        self._run((True, {"account": "123456789012", "name": "acct-name",
+                          "region": "us-east-1", "stack_type": "init",
+                          "stack_name": "s", "stack_id": "sid"}))
+
+    def test_ok_false_still_raises_as_before(self):
+        with self.assertRaises(Exception):
+            self._run((False, {"account": "123456789012", "name": "acct-name",
+                               "region": "us-east-1", "stack_type": "init",
+                               "stack_name": "s", "stack_id": "sid"}))
+
+
 class TestGetActiveEksRegions(unittest.TestCase):
     def test_returns_only_regions_with_clusters(self):
         session = MagicMock()
@@ -1132,6 +1311,78 @@ class TestClassifyStackStatus(unittest.TestCase):
                          ("failed", "red"))
         self.assertEqual(organization_integration._classify_stack_status("SOME_NEW_CFN_STATUS"),
                          ("failed", "red"))
+
+
+class TestRegionsToIntegrateNotMutatedAcrossAccounts(unittest.TestCase):
+    """--regions is parsed once in main() into a single list object, then
+    passed as regions_to_integrate to EVERY account processed in the run
+    (and, under --parallel, to every account's thread concurrently).
+    integrate_sub_account's READY-account branch used to bind
+    potential_regions directly to that same object and then extend() it in
+    place - one account's current_regions would leak into every account
+    processed afterward, and could race under --parallel."""
+
+    def _run_ready_account(self, sub_account, regions_to_integrate, registered_cloud_regions):
+        sts_client = MagicMock()
+        graph_client = MagicMock()
+        graph_client.get_accounts.return_value = [
+            {"cloud_account_id": sub_account[0], "status": "READY",
+             "cloud_regions": registered_cloud_regions,
+             "realtime_regions": [{"region_name": r} for r in registered_cloud_regions],
+             "lightlytics_collection_token": "tok"},
+        ]
+        graph_client.get_account_response_config.return_value = {"remediation": {"status": "done"}}
+
+        session = MagicMock()
+        session.region_name = "us-east-1"
+
+        with patch.object(organization_integration, "boto3") as mock_boto3:
+            mock_boto3.Session.return_value = session
+            organization_integration.integrate_sub_account(
+                "https://example.streamsec.io", sub_account, sts_client, graph_client,
+                ["us-east-1"], "abc123", None, regions_to_integrate,
+                "OrganizationAccountAccessRole", sub_account[0],
+                parallel=False, response=False,
+            )
+
+    def test_shared_regions_list_is_not_mutated_by_one_accounts_run(self):
+        shared_regions_to_integrate = ["us-east-1", "us-west-2"]
+        original_snapshot = list(shared_regions_to_integrate)
+
+        with patch.object(organization_integration, "update_regions", return_value=True), \
+                patch.object(organization_integration, "deploy_all_collection_stacks", return_value=None):
+            self._run_ready_account(
+                ("111111111111", "acct-1"), shared_regions_to_integrate,
+                registered_cloud_regions=["eu-west-1"],  # different from regions_to_integrate -> triggers extend()
+            )
+
+        self.assertEqual(
+            shared_regions_to_integrate, original_snapshot,
+            "the caller's --regions list must never be mutated by any account's own run - "
+            "main() passes this SAME object to every account in the run")
+
+    def test_second_account_is_not_polluted_by_the_first_accounts_registered_regions(self):
+        shared_regions_to_integrate = ["us-east-1"]
+
+        with patch.object(organization_integration, "update_regions", return_value=True) as mock_update_regions, \
+                patch.object(organization_integration, "deploy_all_collection_stacks", return_value=None):
+            self._run_ready_account(
+                ("111111111111", "acct-1"), shared_regions_to_integrate,
+                registered_cloud_regions=["eu-west-1"],
+            )
+            self._run_ready_account(
+                ("222222222222", "acct-2"), shared_regions_to_integrate,
+                registered_cloud_regions=["ap-south-1"],
+            )
+
+        # Each account's update_regions() call must reflect ONLY its own
+        # registered region plus the shared candidate list - never a region
+        # leaked in from a DIFFERENT account's earlier run.
+        first_call_regions = sorted(mock_update_regions.call_args_list[0].args[2])
+        second_call_regions = sorted(mock_update_regions.call_args_list[1].args[2])
+        self.assertEqual(first_call_regions, ["eu-west-1", "us-east-1"])
+        self.assertEqual(second_call_regions, ["ap-south-1", "us-east-1"],
+                         "account 2's region set must not include account 1's eu-west-1")
 
 
 if __name__ == "__main__":

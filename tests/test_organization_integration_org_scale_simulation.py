@@ -87,6 +87,16 @@ SCENARIOS = {
 
 
 _seen_stack_ids = {}
+# Set True right before sweep_stack_statuses() runs (see the test method's
+# _spy_sweep). Distinguishes two DIFFERENT real callers that both use a
+# targeted-by-ID describe_stacks(StackName=...): the legacy
+# wait_for_cloudformation() (deploy phase, only ever the init stack, must
+# always resolve immediately or it busy-spins against the frozen fake
+# clock) vs. _sweep_account's final targeted lookup before giving up at
+# the deadline (sweep phase, must respect each scenario's real behavior).
+# Stack naming can't disambiguate this - the init stack is legitimately
+# queried by both, at different times, for different reasons.
+_sweep_phase_started = {"value": False}
 
 
 class _FakeClock:
@@ -209,20 +219,29 @@ def _make_client_for(account_id, service, region_name):
             return {"StackId": stack_id}
         client.create_stack.side_effect = create_stack
 
-        def _statuses_for_account():
+        def _statuses_for_account(StackName=None, **kw):
+            if StackName is not None:
+                if not _sweep_phase_started["value"]:
+                    # wait_for_cloudformation() (deploy phase, init stack
+                    # only) - see _sweep_phase_started's module-level
+                    # comment for why this must always resolve immediately.
+                    return {"Stacks": [{"StackId": StackName, "StackStatus": "CREATE_COMPLETE"}]}
+                # _sweep_account's final targeted lookup (sweep phase) -
+                # must respect the scenario's real behavior, same as the
+                # untargeted branch below, or scenarios 13/14 would falsely
+                # resolve via this fallback instead of properly hitting
+                # TIMED_OUT.
+                if st.get("sweep_describe_stacks_fails"):
+                    raise Exception("simulated ThrottlingException during sweep")
+                live_status = "CREATE_IN_PROGRESS" if st.get("sweep_never_resolves") else "CREATE_COMPLETE"
+                return {"Stacks": [{"StackId": StackName, "StackStatus": live_status}]}
             if st.get("sweep_describe_stacks_fails"):
                 raise Exception("simulated ThrottlingException during sweep")
             live_status = "CREATE_IN_PROGRESS" if st.get("sweep_never_resolves") else "CREATE_COMPLETE"
-            return {"Stacks": [{"StackId": sid, "StackStatus": live_status}
-                               for sid in _seen_stack_ids.get(account_id, set())]}
-        client.describe_stacks.side_effect = lambda **kw: _statuses_for_account()
-        # Legacy wait_for_cloudformation() path (used when wait=True, e.g. the
-        # init stack in sequential/non---parallel mode) polls list_stacks()
-        # instead of describe_stacks() - always resolve immediately so this
-        # pre-existing, untouched-by-this-session code doesn't spin.
-        client.list_stacks.side_effect = lambda **kw: {
-            "StackSummaries": [{"StackId": sid, "StackStatus": "CREATE_COMPLETE"}
-                               for sid in _seen_stack_ids.get(account_id, set())]}
+            stacks = [{"StackId": sid, "StackStatus": live_status}
+                     for sid in _seen_stack_ids.get(account_id, set())]
+            return {"Stacks": stacks}
+        client.describe_stacks.side_effect = _statuses_for_account
         return client
 
     if service == "eks":
@@ -259,6 +278,7 @@ def _make_session(*args, **kwargs):
 class TestOrgScaleSimulation(unittest.TestCase):
     def test_full_org_run_survives_every_injected_failure_mode(self):
         _seen_stack_ids.clear()
+        _sweep_phase_started["value"] = False
 
         registry = {acc_id: dict(scenario) for acc_id, scenario in SCENARIOS.items()}
         graph_client = FakeGraphClient(registry)
@@ -304,6 +324,7 @@ class TestOrgScaleSimulation(unittest.TestCase):
         captured_swept = []
 
         def _spy_sweep(*a, **kw):
+            _sweep_phase_started["value"] = True
             result = real_sweep(*a, **kw)
             captured_swept.extend(result)
             return result

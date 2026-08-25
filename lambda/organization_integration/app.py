@@ -225,10 +225,14 @@ def integrate_sub_account(
         account_information = [acc for acc in graph_client.get_accounts()
                                if acc["cloud_account_id"] == sub_account[0]][0]
 
-        # Deploying the initial integration stack
-        if not deploy_init_stack(
+        # Deploying the initial integration stack. deploy_init_stack now
+        # returns (ok, record) instead of a bare bool (see boto_common.py) -
+        # a 2-tuple is always truthy, so `if not deploy_init_stack(...)`
+        # would never detect a real failure here without unpacking it.
+        init_ok, _ = deploy_init_stack(
                 account_information, graph_client, sub_account, sub_account_session, random_int, not parallel,
-                custom_tags=custom_tags):
+                custom_tags=custom_tags)
+        if not init_ok:
             err_msg = f"Account: {sub_account[0]} | Something went wrong with init stack deployment"
             print(color(err_msg, "red"))
             raise Exception(err_msg)

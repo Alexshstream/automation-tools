@@ -37,8 +37,16 @@ def wait_for_cloudformation(sub_account, cft_id, cf_client, timeout=240):
     print(color(
         f"Account: {sub_account[0]} | Waiting for stack to finish creating, timeout is {timeout} seconds", "blue"))
     while dt_diff < timeout:
-        stack_list = cf_client.list_stacks()
-        status = [stack['StackStatus'] for stack in stack_list['StackSummaries'] if stack['StackId'] == cft_id][0]
+        # describe_stacks(StackName=cft_id) targets this ONE stack directly
+        # by ID - list_stacks() (the prior implementation) returns an
+        # unpaginated, unfiltered page of every stack in the account; in a
+        # busy account with enough other stacks, this one could land past
+        # page 1 and never appear, raising IndexError on the [0] below and
+        # getting caught upstream as a false stack-deployment failure for a
+        # stack that was actually fine. describe_stacks by ID has no such
+        # pagination hazard, and (unlike list_stacks) still finds the stack
+        # even if it's already been deleted.
+        status = cf_client.describe_stacks(StackName=cft_id)["Stacks"][0]["StackStatus"]
         dt_finish = datetime.datetime.utcnow()
         dt_diff = (dt_finish - dt_start).total_seconds()
 
@@ -608,8 +616,35 @@ def _sweep_account(account_id, records, sts_client, management_account_id, contr
                 break
             time.sleep(poll_interval)
 
-        # Deadline reached with records still unresolved - a distinct "still in
-        # progress, check manually" bucket, never conflated with a real failure.
+        # Deadline reached with records still unresolved. Before giving up,
+        # try one final TARGETED lookup per record (describe_stacks by the
+        # specific stack_id/ARN) rather than immediately falling into
+        # TIMED_OUT - the batched, unfiltered describe_stacks() calls above
+        # never return a stack that's already reached DELETE_COMPLETE (real
+        # AWS behavior: an unfiltered DescribeStacks omits fully-deleted
+        # stacks entirely), so a stack that rolled back and was deleted
+        # would otherwise be misreported as "still in progress, check
+        # manually" instead of its real, genuinely terminal status. A
+        # by-ID lookup finds it regardless. Best-effort only: any failure
+        # here (including StackNotFoundException-equivalents, e.g. a stack
+        # deleted long enough ago to have aged out of CloudFormation's
+        # short retention for deleted stacks) just falls through to the
+        # existing TIMED_OUT bucket below, no worse than before this check
+        # existed.
+        for region, recs in by_region.items():
+            for r in recs:
+                if r.get("final_status") is not None:
+                    continue
+                try:
+                    stack = region_clients[region].describe_stacks(
+                        StackName=r["stack_id"])["Stacks"][0]
+                    status = stack["StackStatus"]
+                    if _terminal_stack_status(status):
+                        r["final_status"] = status
+                        r["status_reason"] = stack.get("StackStatusReason") or r.get("status_reason")
+                except Exception:
+                    continue
+
         # Preserve any pre-existing status_reason (e.g. deploy_init_stack's
         # note that the backend reached READY while the local CFN wait had
         # already timed out) the same way the terminal-status branch above
@@ -636,8 +671,16 @@ def _sweep_account(account_id, records, sts_client, management_account_id, contr
 
 def sweep_stack_statuses(stack_records, sts_client, management_account_id,
                          control_role="OrganizationAccountAccessRole",
-                         poll_interval=10, timeout=300):
+                         poll_interval=10, timeout=600):
     """Concurrently determine the final status of every stack this run created.
+
+    timeout defaults to 600s (10 minutes), not the CloudFormation
+    console's typical few-minutes deploy time for these templates
+    (Lambda + IAM + EventBridge, no heavy provisioning) but a deliberately
+    generous buffer for slower regions/accounts. This is now a genuinely
+    per-account budget (see _sweep_account) rather than one clock shared
+    across the whole run, so raising it doesn't cost anything for accounts
+    that resolve quickly - it only helps ones that are genuinely slower.
 
     stack_records: list of dicts, each shaped {"account", "name", "region",
     "stack_type", "stack_name", "stack_id"}. Returns the same list, each record

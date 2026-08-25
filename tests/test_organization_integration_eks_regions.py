@@ -178,8 +178,8 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
     def test_ready_account_auto_detect_uses_potential_regions_not_stale_registered_regions(self):
         # Already-READY account whose real active AWS regions (potential_regions,
         # via get_active_regions) have grown since last onboarding -
-        # --eks_audit_logs_auto_detect must scan the fresh set, not the
-        # account's currently-registered (possibly stale) cloud_regions.
+        # --eks_audit_logs_auto_detect must scan the fresh set too, not just
+        # the account's currently-registered cloud_regions.
         mock_eks = self._run_ready_account(
             potential_regions=["us-east-1", "us-west-2"],
             registered_cloud_regions=["us-east-1"],
@@ -190,8 +190,29 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
         passed_account_information = mock_eks.call_args[0][1]
         self.assertEqual(
             sorted(passed_account_information["cloud_regions"]), ["us-east-1", "us-west-2"],
-            "auto-detect must scan potential_regions, not the stale registered cloud_regions")
+            "auto-detect must scan potential_regions in addition to registered cloud_regions")
         self.assertIsNone(mock_eks.call_args[0][4])
+
+    def test_ready_account_auto_detect_still_scans_a_registered_region_with_no_running_instances(self):
+        # A registered region can host a real EKS cluster (e.g. Fargate-only,
+        # or simply no EC2 instances running right now) even though
+        # get_active_regions() - which only looks for running EC2 instances -
+        # would never report it as "active". potential_regions alone would
+        # silently drop this region from the EKS scan; the union with
+        # current_regions (the account's real registered regions) must not.
+        mock_eks = self._run_ready_account(
+            potential_regions=["us-east-1", "us-west-2"],
+            registered_cloud_regions=["us-east-1", "eu-west-1"],
+            eks_audit_logs=False, eks_audit_logs_regions=None,
+            eks_audit_logs_auto_detect=True,
+        )
+        mock_eks.assert_called_once()
+        passed_account_information = mock_eks.call_args[0][1]
+        self.assertEqual(
+            sorted(passed_account_information["cloud_regions"]),
+            ["eu-west-1", "us-east-1", "us-west-2"],
+            "a registered region with no currently-running EC2 instances (e.g. "
+            "Fargate-only EKS) must still be scanned, not silently dropped")
 
     def test_ready_account_plain_eks_audit_logs_keeps_existing_behavior(self):
         # Plain --eks_audit_logs (no auto-detect) must keep scanning the
