@@ -77,8 +77,11 @@ SCENARIOS = {
     MANAGEMENT_ACCOUNT_ID: {"desc": "management account itself as a target "
                                     "(no assume-role needed)"},
     "100000000016": {"desc": "response stack requested and its create_stack fails"},
-    "100000000017": {"desc": "wait_for_account_connection returns non-READY "
+    "100000000017": {"desc": "already READY, region update needed, but "
+                             "wait_for_account_connection returns non-READY "
                              "after edit_regions",
+                     "status": "READY", "in_registry": True,
+                     "cloud_regions": ["us-east-1"], "realtime_regions": ["us-east-1"],
                      "connection_check_fails": True},
 }
 
@@ -366,133 +369,161 @@ class TestOrgScaleSimulation(unittest.TestCase):
             self.assertIn(needle, matches[0].get("status_reason") or "",
                           f"{acc_id} {stack_type}/{region} status_reason mismatch: {matches[0]}")
 
-        # 1: happy path, brand new, no EKS - full success, nothing left behind.
-        self.assertNotIn("100000000001", failed_accounts)
-        self.assertEqual(stacks_of("100000000001"), [
-            ("collection", "us-east-1", "CREATE_COMPLETE"),
-            ("collection", "us-west-2", "CREATE_COMPLETE"),
-            ("init", "us-east-1", "CREATE_COMPLETE"),
-            ("response", "us-east-1", "CREATE_COMPLETE"),
-        ])
+        # Each scenario is wrapped in its own subTest so one scenario's
+        # assertion failure doesn't hide every other scenario's pass/fail
+        # status in the same run - all 17 get checked and reported, not
+        # just whichever fails first.
 
-        # 2: happy path, brand new, has EKS - EKS audit stacks in both active
-        # regions (regression test for the active_regions-vs-stale-
-        # cloud_regions EKS detection bug fixed alongside this test).
-        self.assertNotIn("100000000002", failed_accounts)
-        acc2 = stacks_of("100000000002")
-        self.assertIn(("eks_audit", "us-east-1", "CREATE_COMPLETE"), acc2)
-        self.assertIn(("eks_audit", "us-west-2", "CREATE_COMPLETE"), acc2)
+        with self.subTest(account="1: happy path, no EKS"):
+            # brand new, no EKS - full success, nothing left behind.
+            self.assertNotIn("100000000001", failed_accounts)
+            self.assertEqual(stacks_of("100000000001"), [
+                ("collection", "us-east-1", "CREATE_COMPLETE"),
+                ("collection", "us-west-2", "CREATE_COMPLETE"),
+                ("init", "us-east-1", "CREATE_COMPLETE"),
+                ("response", "us-east-1", "CREATE_COMPLETE"),
+            ])
 
-        # 3: bad control role - never got past assume_role, zero AWS calls.
-        self.assertIn("100000000003", failed_accounts)
-        self.assertEqual(len(_seen_stack_ids.get("100000000003", set())), 0,
-                         "bad-control-role account should never have reached "
-                         "any create_stack call")
-        self.assertEqual(by_account.get("100000000003", []), [])
+        with self.subTest(account="2: happy path, has EKS"):
+            # brand new, has EKS - EKS audit stacks in both active regions
+            # (regression test for the active_regions-vs-stale-cloud_regions
+            # EKS detection bug fixed alongside this test).
+            self.assertNotIn("100000000002", failed_accounts)
+            acc2 = stacks_of("100000000002")
+            self.assertIn(("eks_audit", "us-east-1", "CREATE_COMPLETE"), acc2)
+            self.assertIn(("eks_audit", "us-west-2", "CREATE_COMPLETE"), acc2)
 
-        # 4: init stack create_stack fails outright - SUBMIT_FAILED, fatal to
-        # the whole account (nothing downstream of init can proceed).
-        self.assertIn("100000000004", failed_accounts)
-        assert_reason_contains("100000000004", "init", "us-east-1",
-                               "simulated init stack create_stack failure")
+        with self.subTest(account="3: bad control role"):
+            # never got past assume_role, zero AWS calls.
+            self.assertIn("100000000003", failed_accounts)
+            self.assertEqual(len(_seen_stack_ids.get("100000000003", set())), 0,
+                             "bad-control-role account should never have reached "
+                             "any create_stack call")
+            self.assertEqual(by_account.get("100000000003", []), [])
 
-        # 5: one collection region fails, the other succeeds - partial
-        # failure is non-fatal to the account's overall run.
-        self.assertNotIn("100000000005", failed_accounts)
-        assert_reason_contains("100000000005", "collection", "us-west-2",
-                               "LimitExceededException")
-        self.assertIn(("collection", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000005"))
+        with self.subTest(account="4: init create_stack fails"):
+            # SUBMIT_FAILED, fatal to the whole account (nothing downstream
+            # of init can proceed).
+            self.assertIn("100000000004", failed_accounts)
+            assert_reason_contains("100000000004", "init", "us-east-1",
+                                   "simulated init stack create_stack failure")
 
-        # 6: EKS create_stack fails for the detected region(s) - non-fatal,
-        # rest of the account still succeeds.
-        self.assertNotIn("100000000006", failed_accounts)
-        assert_reason_contains("100000000006", "eks_audit", "us-east-1",
-                               "simulated EKS audit stack create_stack failure")
-        self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000006"))
+        with self.subTest(account="5: partial collection failure"):
+            # one collection region fails, the other succeeds - partial
+            # failure is non-fatal to the account's overall run.
+            self.assertNotIn("100000000005", failed_accounts)
+            assert_reason_contains("100000000005", "collection", "us-west-2",
+                                   "LimitExceededException")
+            self.assertIn(("collection", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000005"))
 
-        # 7: EKS get_function throttled (not ResourceNotFoundException) -
-        # treated as a submit failure for that region, not silently lost or
-        # propagated as a hard account failure.
-        self.assertNotIn("100000000007", failed_accounts)
-        assert_reason_contains("100000000007", "eks_audit", "us-east-1",
-                               "simulated throttling on get_function")
+        with self.subTest(account="6: EKS create_stack fails"):
+            # non-fatal, rest of the account still succeeds.
+            self.assertNotIn("100000000006", failed_accounts)
+            assert_reason_contains("100000000006", "eks_audit", "us-east-1",
+                                   "simulated EKS audit stack create_stack failure")
+            self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000006"))
 
-        # 8: EKS lambda already exists - correctly skipped, no stack record
-        # at all (not a failure, not a success record either).
-        self.assertNotIn("100000000008", failed_accounts)
-        self.assertFalse(
-            [r for r in by_account.get("100000000008", []) if r["stack_type"] == "eks_audit"],
-            "lambda-already-exists EKS region should produce no stack record")
+        with self.subTest(account="7: EKS get_function throttled"):
+            # not ResourceNotFoundException - treated as a submit failure
+            # for that region, not silently lost or propagated as a hard
+            # account failure.
+            self.assertNotIn("100000000007", failed_accounts)
+            assert_reason_contains("100000000007", "eks_audit", "us-east-1",
+                                   "simulated throttling on get_function")
 
-        # 9: already READY, region set changed, has EKS - no init stack
-        # (already integrated), the new region's collection stack, and
-        # (regression check for the READY-account potential_regions fix)
-        # an eks_audit stack in us-west-2 - a region NOT in this account's
-        # registered cloud_regions (["us-east-1"]) but which is real and
-        # active per get_active_regions(). Under the old --eks_audit_logs
-        # flag this would have been missed entirely (it only scans
-        # cloud_regions); --eks_audit_logs_auto_detect must catch it.
-        self.assertNotIn("100000000009", failed_accounts)
-        self.assertEqual(stacks_of("100000000009"), [
-            ("collection", "us-west-2", "CREATE_COMPLETE"),
-            ("eks_audit", "us-east-1", "CREATE_COMPLETE"),
-            ("eks_audit", "us-west-2", "CREATE_COMPLETE"),
-            ("response", "us-east-1", "CREATE_COMPLETE"),
-        ])
+        with self.subTest(account="8: EKS lambda already exists"):
+            # correctly skipped, no stack record at all (not a failure, not
+            # a success record either).
+            self.assertNotIn("100000000008", failed_accounts)
+            self.assertFalse(
+                [r for r in by_account.get("100000000008", []) if r["stack_type"] == "eks_audit"],
+                "lambda-already-exists EKS region should produce no stack record")
 
-        # 10: already READY, fully quiescent - no collection stack at all,
-        # only the always-evaluated response stack.
-        self.assertNotIn("100000000010", failed_accounts)
-        self.assertEqual(stacks_of("100000000010"), [
-            ("response", "us-east-1", "CREATE_COMPLETE"),
-        ])
+        with self.subTest(account="9: READY, new region, has EKS"):
+            # already READY, region set changed, has EKS - no init stack
+            # (already integrated), the new region's collection stack, and
+            # (regression check for the READY-account potential_regions
+            # fix) an eks_audit stack in us-west-2 - a region NOT in this
+            # account's registered cloud_regions (["us-east-1"]) but which
+            # is real and active per get_active_regions(). Under the old
+            # --eks_audit_logs flag this would have been missed entirely
+            # (it only scans cloud_regions); --eks_audit_logs_auto_detect
+            # must catch it.
+            self.assertNotIn("100000000009", failed_accounts)
+            self.assertEqual(stacks_of("100000000009"), [
+                ("collection", "us-west-2", "CREATE_COMPLETE"),
+                ("eks_audit", "us-east-1", "CREATE_COMPLETE"),
+                ("eks_audit", "us-west-2", "CREATE_COMPLETE"),
+                ("response", "us-east-1", "CREATE_COMPLETE"),
+            ])
 
-        # 11: backend reports an unexpected status - hard failure, no stacks.
-        self.assertIn("100000000011", failed_accounts)
-        self.assertEqual(by_account.get("100000000011", []), [])
+        with self.subTest(account="10: READY, fully quiescent"):
+            # no collection stack at all, only the always-evaluated response
+            # stack.
+            self.assertNotIn("100000000010", failed_accounts)
+            self.assertEqual(stacks_of("100000000010"), [
+                ("response", "us-east-1", "CREATE_COMPLETE"),
+            ])
 
-        # 12: backend inconsistency (connection-wait says READY, account-list
-        # never leaves UNINITIALIZED) - update_regions' own local timeout
-        # fires; init/response stacks already went out for real before that
-        # and remain (honest reporting of real leftover AWS resources).
-        self.assertIn("100000000012", failed_accounts)
-        self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000012"))
-        self.assertIn(("response", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000012"))
+        with self.subTest(account="11: unexpected backend status"):
+            # hard failure, no stacks.
+            self.assertIn("100000000011", failed_accounts)
+            self.assertEqual(by_account.get("100000000011", []), [])
 
-        # 13: sweep-phase describe_stacks always fails for this account - the
-        # sweep must isolate that (retry, not crash) and eventually give up
-        # with TIMED_OUT rather than a false CREATE_COMPLETE or an unhandled
-        # error; the account's own run still succeeds (deploy phase is fine).
-        self.assertNotIn("100000000013", failed_accounts)
-        self.assertTrue(by_account.get("100000000013"))
-        for r in by_account["100000000013"]:
-            self.assertEqual(r["final_status"], "TIMED_OUT", r)
+        with self.subTest(account="12: backend inconsistency"):
+            # connection-wait says READY, account-list never leaves
+            # UNINITIALIZED - update_regions' own local timeout fires;
+            # init/response stacks already went out for real before that
+            # and remain (honest reporting of real leftover AWS resources).
+            self.assertIn("100000000012", failed_accounts)
+            self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000012"))
+            self.assertIn(("response", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000012"))
 
-        # 14: stack submitted but never resolves in CloudFormation - sweep
-        # deadline fires, TIMED_OUT, not a false success or a hang.
-        self.assertNotIn("100000000014", failed_accounts)
-        self.assertTrue(by_account.get("100000000014"))
-        for r in by_account["100000000014"]:
-            self.assertEqual(r["final_status"], "TIMED_OUT", r)
+        with self.subTest(account="13: sweep-phase describe_stacks fails"):
+            # the sweep must isolate that (retry, not crash) and eventually
+            # give up with TIMED_OUT rather than a false CREATE_COMPLETE or
+            # an unhandled error; the account's own run still succeeds
+            # (deploy phase is fine).
+            self.assertNotIn("100000000013", failed_accounts)
+            self.assertTrue(by_account.get("100000000013"))
+            for r in by_account["100000000013"]:
+                self.assertEqual(r["final_status"], "TIMED_OUT", r)
 
-        # management account as its own target - no assume_role needed, full
-        # success just like any other account.
-        self.assertNotIn(MANAGEMENT_ACCOUNT_ID, failed_accounts)
-        self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of(MANAGEMENT_ACCOUNT_ID))
+        with self.subTest(account="14: stack never resolves"):
+            # submitted but never resolves in CloudFormation - sweep
+            # deadline fires, TIMED_OUT, not a false success or a hang.
+            self.assertNotIn("100000000014", failed_accounts)
+            self.assertTrue(by_account.get("100000000014"))
+            for r in by_account["100000000014"]:
+                self.assertEqual(r["final_status"], "TIMED_OUT", r)
 
-        # 16: response stack create_stack fails - non-fatal, rest succeeds.
-        self.assertNotIn("100000000016", failed_accounts)
-        assert_reason_contains("100000000016", "response", "us-east-1",
-                               "simulated response stack create_stack failure")
-        self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000016"))
+        with self.subTest(account="15: management account as target"):
+            # no assume_role needed, full success just like any other
+            # account.
+            self.assertNotIn(MANAGEMENT_ACCOUNT_ID, failed_accounts)
+            self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of(MANAGEMENT_ACCOUNT_ID))
 
-        # 17: wait_for_account_connection returns non-READY after the init
-        # stack itself succeeded - fatal to the account, but the init stack
-        # that already went out for real is still reported honestly.
-        self.assertIn("100000000017", failed_accounts)
-        init17 = [r for r in by_account.get("100000000017", []) if r["stack_type"] == "init"]
-        self.assertEqual(len(init17), 1)
-        self.assertEqual(init17[0]["final_status"], "CREATE_COMPLETE")
+        with self.subTest(account="16: response create_stack fails"):
+            # non-fatal, rest succeeds.
+            self.assertNotIn("100000000016", failed_accounts)
+            assert_reason_contains("100000000016", "response", "us-east-1",
+                                   "simulated response stack create_stack failure")
+            self.assertIn(("init", "us-east-1", "CREATE_COMPLETE"), stacks_of("100000000016"))
+
+        with self.subTest(account="17: READY, connection check fails on region update"):
+            # already READY, region update needed - update_regions() calls
+            # edit_regions() then its OWN wait_for_account_connection()
+            # check (distinct from deploy_init_stack's, which only
+            # brand-new accounts reach) - non-READY there is fatal to the
+            # account, but the response stack that already went out for
+            # real is still reported honestly.
+            self.assertIn("100000000017", failed_accounts)
+            self.assertFalse(
+                [r for r in by_account.get("100000000017", []) if r["stack_type"] == "init"],
+                "17 is already-READY - it must never reach deploy_init_stack at all")
+            response17 = [r for r in by_account.get("100000000017", []) if r["stack_type"] == "response"]
+            self.assertEqual(len(response17), 1)
+            self.assertEqual(response17[0]["final_status"], "CREATE_COMPLETE")
 
         # Exactly the 5 genuinely-fatal scenarios should be in the failures
         # list - no more (nothing over-triggering), no fewer (nothing

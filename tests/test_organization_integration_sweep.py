@@ -151,6 +151,32 @@ class TestSweepStackStatuses(unittest.TestCase):
                          "a late-starting account's deadline must be measured from "
                          "its own start time, not an earlier shared reference point")
 
+    def test_sweep_stack_statuses_passes_timeout_through_unchanged_not_a_precomputed_deadline(self):
+        # Covers the actual sweep_stack_statuses -> _sweep_account boundary
+        # the fix changed (test_deadline_is_computed_fresh_... above tests
+        # _sweep_account in isolation and would NOT catch a regression where
+        # sweep_stack_statuses itself started computing and passing a
+        # shared deadline again). Mocking _sweep_account and inspecting
+        # what it's actually called with proves sweep_stack_statuses hands
+        # down the raw timeout, not any value derived from time.time() on
+        # its own side.
+        records = [self._record("111", "us-east-1", "sid-1"),
+                  self._record("222", "us-west-2", "sid-2")]
+
+        with patch.object(boto_common, "_sweep_account") as mock_sweep_account, \
+                patch.object(boto_common.time, "time", return_value=999_999.0):
+            boto_common.sweep_stack_statuses(
+                records, sts_client=MagicMock(), management_account_id="111",
+                poll_interval=7, timeout=45)
+
+        self.assertEqual(mock_sweep_account.call_count, 2)
+        for call in mock_sweep_account.call_args_list:
+            # Last positional arg must be the literal timeout (45), never a
+            # deadline computed from time.time() (which would be ~1000044
+            # given the mocked clock above).
+            self.assertEqual(call.args[-1], 45)
+            self.assertEqual(call.args[-2], 7)  # poll_interval, unchanged too
+
     def test_timed_out_preserves_a_pre_existing_status_reason(self):
         # deploy_init_stack can set a status_reason on a record that has no
         # final_status yet (e.g. "account reached READY; local
@@ -227,10 +253,16 @@ class TestSweepStackStatuses(unittest.TestCase):
         self.assertEqual(result[0]["status_reason"], "Secret name already exists")
 
     def test_two_stacks_same_account_region_use_single_describe_stacks_call(self):
+        # Deliberately DIFFERENT statuses per stack_id - if the matching
+        # logic were broken (e.g. always taking the first stack in the
+        # response, or zipping records to response order instead of
+        # keying by stack_id), both records would end up with the same
+        # (wrong) status and this test would catch it; two identical
+        # statuses could not.
         client = MagicMock()
         client.describe_stacks.return_value = {"Stacks": [
             {"StackId": "sid-1", "StackStatus": "CREATE_COMPLETE"},
-            {"StackId": "sid-2", "StackStatus": "CREATE_COMPLETE"},
+            {"StackId": "sid-2", "StackStatus": "ROLLBACK_COMPLETE"},
         ]}
         records = [
             self._record("111", "us-east-1", "sid-1", stack_type="collection", stack_name="s1"),
@@ -242,8 +274,8 @@ class TestSweepStackStatuses(unittest.TestCase):
                 records, sts_client=MagicMock(), management_account_id="111",
                 poll_interval=0, timeout=30)
 
-        self.assertEqual([r["final_status"] for r in result],
-                          ["CREATE_COMPLETE", "CREATE_COMPLETE"])
+        by_stack_id = {r["stack_id"]: r["final_status"] for r in result}
+        self.assertEqual(by_stack_id, {"sid-1": "CREATE_COMPLETE", "sid-2": "ROLLBACK_COMPLETE"})
         # Batched per region per tick, not once per stack.
         self.assertEqual(client.describe_stacks.call_count, 1)
 
