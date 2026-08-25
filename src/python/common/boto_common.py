@@ -101,12 +101,14 @@ def get_active_regions(sub_account_session, regions):
         active_regions.append("us-east-1")
     return list(set(active_regions))
 
-def _region_has_eks_cluster(sub_account_session, region):
+def _region_has_eks_cluster(eks_client):
     """True if this region has at least one EKS cluster. Raises on any API
     failure - the caller (get_active_eks_regions) is responsible for
     isolating one region's failure from the rest, matching every other
-    per-region loop in this file."""
-    eks_client = sub_account_session.client('eks', region_name=region)
+    per-region loop in this file. Takes an already-constructed client (see
+    get_active_eks_regions) rather than building one itself - boto3.Session
+    isn't guaranteed thread-safe for concurrent .client() calls off one
+    shared session."""
     return len(eks_client.list_clusters()['clusters']) > 0
 
 
@@ -116,9 +118,29 @@ def get_active_eks_regions(sub_account, sub_account_session, regions):
     # sequential, that's tens of seconds added to every account's run just
     # for this one check. Same ThreadPoolExecutor(max_workers=8) pattern
     # deploy_all_collection_stacks already uses, for the same reason.
+    #
+    # Clients are all built here, in the calling thread, before any
+    # submission - boto3.Session.client() isn't guaranteed thread-safe when
+    # several worker threads call it concurrently off the same shared
+    # session (this scan is regions x 8 workers x --parallel accounts, the
+    # highest-fanout call in the tool, so this is worth getting right here
+    # even though the codebase has other spots that don't). Workers only
+    # ever call the already-built client's own list_clusters(), never
+    # touch the session.
+    #
+    # config=LAMBDA_CLIENT_CONFIG (adaptive retry, reused here only for its
+    # retry/timeout settings, not anything Lambda-specific - same reuse
+    # this file already does elsewhere): at this fanout, a throttled
+    # list_clusters would otherwise be far more likely to exhaust boto3's
+    # default retry budget, dropping a region from detection - the same
+    # "silently never gets a stack" failure mode logged above, just from a
+    # different cause.
     active_regions = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_region_has_eks_cluster, sub_account_session, region): region
+        clients = {region: sub_account_session.client(
+                       'eks', region_name=region, config=LAMBDA_CLIENT_CONFIG)
+                   for region in regions}
+        futures = {executor.submit(_region_has_eks_cluster, clients[region]): region
                   for region in regions}
         for future in futures:
             region = futures[future]

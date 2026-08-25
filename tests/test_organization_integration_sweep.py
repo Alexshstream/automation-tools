@@ -833,7 +833,7 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
         sub_account = ("123456789012", "acct-name")
         session = MagicMock()
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             client = MagicMock()
             client.create_stack.return_value = {
                 "StackId": f"arn:aws:cloudformation:{region_name}:123456789012:"
@@ -861,7 +861,7 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
         sub_account = ("123456789012", "acct-name")
         session = MagicMock()
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             client = MagicMock()
             if region_name == "eu-west-1":
                 client.create_stack.side_effect = Exception("LimitExceededException")
@@ -994,7 +994,7 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
             "StackId": "arn:aws:cloudformation:eu-west-1:123456789012:"
                        "stack/StreamSecurity-eks-audit-logs-eu-west-1-42/uuid"}
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             if service == "lambda":
                 return lambda_exists if region_name == "us-east-1" else lambda_missing
             return cf_client
@@ -1029,7 +1029,7 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
         cf_failing = MagicMock()
         cf_failing.create_stack.side_effect = Exception("region not enabled")
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             if service == "lambda":
                 return lambda_missing
             return cf_ok if region_name == "us-east-1" else cf_failing
@@ -1072,7 +1072,7 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
             "StackId": "arn:aws:cloudformation:us-east-1:123456789012:"
                        "stack/StreamSecurity-eks-audit-logs-us-east-1-42/uuid"}
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             if service == "lambda":
                 return lambda_ok if region_name == "us-east-1" else lambda_throttled
             return cf_client
@@ -1105,7 +1105,7 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
             "StackId": "arn:aws:cloudformation:us-east-1:123456789012:"
                        "stack/StreamSecurity-eks-audit-logs-us-east-1-42/uuid"}
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             return lambda_missing if service == "lambda" else cf_client
         session.client.side_effect = client_factory
 
@@ -1159,7 +1159,7 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
 
         session = MagicMock()
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             if service == "eks":
                 return eks_client_east if region_name == "us-east-1" else eks_client_west
             if service == "lambda":
@@ -1251,7 +1251,7 @@ class TestGetActiveEksRegions(unittest.TestCase):
     def test_returns_only_regions_with_clusters(self):
         session = MagicMock()
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             client = MagicMock()
             has_cluster = region_name == "us-east-1"
             client.list_clusters.return_value = {"clusters": ["c1"] if has_cluster else []}
@@ -1263,13 +1263,54 @@ class TestGetActiveEksRegions(unittest.TestCase):
 
         self.assertEqual(result, ["us-east-1"])
 
+    def test_clients_built_with_adaptive_retry_config(self):
+        # At regions x 8 workers x --parallel accounts fanout, a throttled
+        # list_clusters without adaptive retries is far more likely to
+        # exhaust boto3's default retry budget and drop a region from
+        # detection - the same "silently never gets a stack" failure this
+        # whole PR exists to eliminate.
+        session = MagicMock()
+        session.client.return_value.list_clusters.return_value = {"clusters": []}
+
+        boto_common.get_active_eks_regions(
+            ("111111111111", "acct"), session, ["us-east-1", "eu-west-1"])
+
+        for call in session.client.call_args_list:
+            self.assertEqual(call.kwargs.get("config"), boto_common.LAMBDA_CLIENT_CONFIG)
+
+    def test_clients_are_built_in_the_calling_thread_not_inside_workers(self):
+        # boto3.Session isn't guaranteed thread-safe for concurrent
+        # .client() calls off one shared session - session.client() must
+        # only ever be called from this function's own (calling) thread,
+        # never from inside a worker submitted to the pool.
+        import threading
+        calling_thread = threading.current_thread()
+        client_call_threads = []
+
+        session = MagicMock()
+
+        def client_factory(service, region_name=None, **kwargs):
+            client_call_threads.append(threading.current_thread())
+            client = MagicMock()
+            client.list_clusters.return_value = {"clusters": []}
+            return client
+        session.client.side_effect = client_factory
+
+        boto_common.get_active_eks_regions(
+            ("111111111111", "acct"), session, ["us-east-1", "eu-west-1", "us-west-2"])
+
+        self.assertTrue(client_call_threads, "session.client() was never called")
+        self.assertTrue(all(t is calling_thread for t in client_call_threads),
+                        "session.client() must only be called from the calling thread, "
+                        "never from inside a worker")
+
     def test_one_region_failure_does_not_abort_scanning_remaining_regions(self):
         # A single region's failure - swallowed and logged, not re-raised -
         # must not prevent the (concurrently-running) rest from being
         # scanned or losing a real cluster found elsewhere.
         session = MagicMock()
 
-        def client_factory(service, region_name=None):
+        def client_factory(service, region_name=None, **kwargs):
             client = MagicMock()
             if region_name == "us-east-1":
                 client.list_clusters.side_effect = Exception("simulated throttling")
