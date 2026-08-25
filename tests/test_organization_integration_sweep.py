@@ -396,6 +396,31 @@ class TestSweepStackStatuses(unittest.TestCase):
         self.assertEqual(result[0]["final_status"], "ERROR")
         self.assertIn("could not construct cloudformation client", result[0]["status_reason"])
 
+    def test_sweep_phase_assume_role_failure_for_non_management_account_marks_error(self):
+        # The other session-construction-failure test above uses
+        # management_account_id == the record's account, which takes the
+        # boto3.Session() (no assume-role) branch entirely -
+        # _session_for_sweep_account's own sts_client.assume_role() call,
+        # specifically during the sweep phase (not the deploy phase, which
+        # has its own separate assume_role and its own separate test
+        # coverage), is never exercised failing anywhere else in the suite.
+        # An indentation/refactor bug that stopped wrapping this call in
+        # the account-wide ERROR try/except would ship undetected without
+        # this.
+        sts_client = MagicMock()
+        sts_client.assume_role.side_effect = Exception("AccessDenied: assume-role failed")
+        record = self._record("222222222222", "us-east-1", "sid-1")
+
+        result = boto_common.sweep_stack_statuses(
+            [record], sts_client=sts_client, management_account_id="111111111111",
+            control_role="OrganizationAccountAccessRole", poll_interval=0, timeout=30)
+
+        sts_client.assume_role.assert_called_once_with(
+            RoleArn="arn:aws:iam::222222222222:role/OrganizationAccountAccessRole",
+            RoleSessionName="MySessionName")
+        self.assertEqual(result[0]["final_status"], "ERROR")
+        self.assertIn("AccessDenied: assume-role failed", result[0]["status_reason"])
+
     def test_sweep_account_exception_escaping_the_safety_net_is_still_recovered(self):
         # Defense-in-depth: even if _sweep_account itself somehow violated its
         # "never raises" contract, sweep_stack_statuses must still recover
@@ -979,6 +1004,92 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
             [], 42, None, wait=False)
 
         self.assertEqual(records, [])
+
+    def test_deploy_eks_audit_logs_stacks_auto_detects_regions_when_none_passed(self):
+        # Every other direct test of this function passes an explicit
+        # eks_audit_logs_regions list (bypassing the auto-detect fallback
+        # entirely) or an empty cloud_regions list (which trivially returns
+        # [] from get_active_eks_regions without its loop body ever
+        # running). None of them exercise the real "regions=None -> scan
+        # cloud_regions -> deploy only where clusters are actually found"
+        # path this function's docstring/behavior promises.
+        sub_account_information = {
+            "lightlytics_collection_token": "tok", "cloud_regions": ["us-east-1", "eu-west-1"]}
+        sub_account = ("123456789012", "acct-name")
+
+        not_found_exc = type("ResourceNotFoundException", (Exception,), {})
+        lambda_client = MagicMock()
+        lambda_client.exceptions.ResourceNotFoundException = not_found_exc
+        lambda_client.get_function.side_effect = not_found_exc()
+
+        # Only us-east-1 has a real cluster - eu-west-1 must be correctly
+        # excluded, not just "some region got a stack".
+        eks_client_east = MagicMock()
+        eks_client_east.list_clusters.return_value = {"clusters": ["real-cluster"]}
+        eks_client_west = MagicMock()
+        eks_client_west.list_clusters.return_value = {"clusters": []}
+
+        cf_client = MagicMock()
+        cf_client.create_stack.return_value = {
+            "StackId": "arn:aws:cloudformation:us-east-1:123456789012:"
+                       "stack/StreamSecurity-eks-audit-logs-us-east-1-42/uuid"}
+
+        session = MagicMock()
+
+        def client_factory(service, region_name=None):
+            if service == "eks":
+                return eks_client_east if region_name == "us-east-1" else eks_client_west
+            if service == "lambda":
+                return lambda_client
+            return cf_client
+        session.client.side_effect = client_factory
+
+        records = boto_common.deploy_eks_audit_logs_stacks(
+            "https://env.streamsec.io/graphql", sub_account_information, session, sub_account,
+            None, 42, None, wait=False)
+
+        self.assertEqual(len(records), 1,
+                         "auto-detect must deploy only to the region with a real cluster")
+        self.assertEqual(records[0]["region"], "us-east-1")
+        eks_client_west.list_clusters.assert_called_once()  # eu-west-1 WAS scanned, just excluded
+
+
+class TestGetActiveEksRegions(unittest.TestCase):
+    def test_returns_only_regions_with_clusters(self):
+        session = MagicMock()
+
+        def client_factory(service, region_name=None):
+            client = MagicMock()
+            has_cluster = region_name == "us-east-1"
+            client.list_clusters.return_value = {"clusters": ["c1"] if has_cluster else []}
+            return client
+        session.client.side_effect = client_factory
+
+        result = boto_common.get_active_eks_regions(session, ["us-east-1", "eu-west-1"])
+
+        self.assertEqual(result, ["us-east-1"])
+
+    def test_one_region_failure_does_not_abort_scanning_remaining_regions(self):
+        # The bare except/continue must isolate a single region's failure -
+        # it must not abort the whole scan and lose a real cluster in a
+        # region checked afterward.
+        session = MagicMock()
+
+        def client_factory(service, region_name=None):
+            client = MagicMock()
+            if region_name == "us-east-1":
+                client.list_clusters.side_effect = Exception("simulated throttling")
+            else:
+                client.list_clusters.return_value = {"clusters": ["c1"]}
+            return client
+        session.client.side_effect = client_factory
+
+        result = boto_common.get_active_eks_regions(
+            session, ["us-east-1", "eu-west-1", "us-west-2"])
+
+        self.assertEqual(sorted(result), ["eu-west-1", "us-west-2"],
+                         "one region's list_clusters() failure must not prevent scanning "
+                         "the remaining regions")
 
 
 class TestClassifyStackStatus(unittest.TestCase):
