@@ -101,16 +101,41 @@ def get_active_regions(sub_account_session, regions):
         active_regions.append("us-east-1")
     return list(set(active_regions))
 
-def get_active_eks_regions(sub_account_session, regions):
+def _region_has_eks_cluster(sub_account_session, region):
+    """True if this region has at least one EKS cluster. Raises on any API
+    failure - the caller (get_active_eks_regions) is responsible for
+    isolating one region's failure from the rest, matching every other
+    per-region loop in this file."""
+    eks_client = sub_account_session.client('eks', region_name=region)
+    return len(eks_client.list_clusters()['clusters']) > 0
+
+
+def get_active_eks_regions(sub_account, sub_account_session, regions):
+    # Scanning every org-enabled region (not just a handful of
+    # registered/active ones) can mean ~20-30 list_clusters() calls -
+    # sequential, that's tens of seconds added to every account's run just
+    # for this one check. Same ThreadPoolExecutor(max_workers=8) pattern
+    # deploy_all_collection_stacks already uses, for the same reason.
     active_regions = []
-    for region in regions:
-        try:
-            eks_client = sub_account_session.client('eks', region_name=region)
-            eks_clusters = eks_client.list_clusters()
-            if len(eks_clusters['clusters']) > 0:
-                active_regions.append(region)
-        except:
-            continue
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_region_has_eks_cluster, sub_account_session, region): region
+                  for region in regions}
+        for future in futures:
+            region = futures[future]
+            try:
+                if future.result():
+                    active_regions.append(region)
+            except Exception as e:
+                # Region-opted-out is expected to be the common case once
+                # this scans every org-enabled region rather than a handful
+                # of registered/active ones - a terse one-liner so it
+                # doesn't bury a genuine throttling/permissions problem in
+                # noise, but still visible: a silently-dropped region here
+                # means an EKS audit-log stack silently never gets deployed
+                # there, exactly the failure mode this whole PR exists to
+                # eliminate, just one level down.
+                print(color(f"Account: {sub_account[0]} | Could not check {region} for "
+                            f"EKS clusters, skipping: {str(e)[:100]}", "yellow"))
     return active_regions
 
 def _stack_record(sub_account, region, stack_type, stack_name, stack_id,
@@ -297,7 +322,8 @@ def deploy_eks_audit_logs_stacks(
         dry_run=False):
     records = []
     if not eks_audit_logs_regions:
-        eks_audit_logs_regions = get_active_eks_regions(sub_account_session, sub_account_information["cloud_regions"])
+        eks_audit_logs_regions = get_active_eks_regions(
+            sub_account, sub_account_session, sub_account_information["cloud_regions"])
 
     if not eks_audit_logs_regions:
         print(color(f"Account: {sub_account[0]} | No active EKS regions found, skipping EKS audit logs for {sub_account[0]}", "blue"))

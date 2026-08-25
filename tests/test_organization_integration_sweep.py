@@ -702,6 +702,7 @@ class TestDeployInitStackReturnShape(unittest.TestCase):
             "stack_id": "arn:aws:cloudformation:us-east-1:123456789012:stack/LightlyticsStack-42/uuid",
         })
         wfc.assert_not_called()
+        graph_client.wait_for_account_connection.assert_not_called()
 
     def test_cloudformation_client_uses_adaptive_retry_config(self):
         # wait_for_cloudformation polls this same client every few seconds;
@@ -716,7 +717,6 @@ class TestDeployInitStackReturnShape(unittest.TestCase):
                 account_information, graph_client, sub_account, session, 42, wait=False)
 
         session.client.assert_called_once_with("cloudformation", config=boto_common.LAMBDA_CLIENT_CONFIG)
-        graph_client.wait_for_account_connection.assert_not_called()
 
     def test_wait_true_ready_returns_true_and_record(self):
         account_information, sub_account, session, cf_client, graph_client = self._setup()
@@ -1258,14 +1258,15 @@ class TestGetActiveEksRegions(unittest.TestCase):
             return client
         session.client.side_effect = client_factory
 
-        result = boto_common.get_active_eks_regions(session, ["us-east-1", "eu-west-1"])
+        result = boto_common.get_active_eks_regions(
+            ("111111111111", "acct"), session, ["us-east-1", "eu-west-1"])
 
         self.assertEqual(result, ["us-east-1"])
 
     def test_one_region_failure_does_not_abort_scanning_remaining_regions(self):
-        # The bare except/continue must isolate a single region's failure -
-        # it must not abort the whole scan and lose a real cluster in a
-        # region checked afterward.
+        # A single region's failure - swallowed and logged, not re-raised -
+        # must not prevent the (concurrently-running) rest from being
+        # scanned or losing a real cluster found elsewhere.
         session = MagicMock()
 
         def client_factory(service, region_name=None):
@@ -1278,11 +1279,27 @@ class TestGetActiveEksRegions(unittest.TestCase):
         session.client.side_effect = client_factory
 
         result = boto_common.get_active_eks_regions(
-            session, ["us-east-1", "eu-west-1", "us-west-2"])
+            ("111111111111", "acct"), session, ["us-east-1", "eu-west-1", "us-west-2"])
 
         self.assertEqual(sorted(result), ["eu-west-1", "us-west-2"],
                          "one region's list_clusters() failure must not prevent scanning "
                          "the remaining regions")
+
+    def test_region_failure_is_logged_not_silent(self):
+        # The bare `except: continue` this replaced swallowed every error
+        # with zero visibility - a silently-dropped region here means an
+        # EKS audit-log stack silently never gets deployed there.
+        session = MagicMock()
+        session.client.return_value.list_clusters.side_effect = Exception("AccessDenied: opted out")
+
+        with patch("builtins.print") as mock_print:
+            result = boto_common.get_active_eks_regions(
+                ("111111111111", "acct"), session, ["eu-west-1"])
+
+        self.assertEqual(result, [])
+        printed = " ".join(str(call) for call in mock_print.call_args_list)
+        self.assertIn("eu-west-1", printed)
+        self.assertIn("AccessDenied", printed)
 
 
 class TestClassifyStackStatus(unittest.TestCase):
