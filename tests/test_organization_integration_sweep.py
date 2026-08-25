@@ -99,6 +99,58 @@ class TestSweepStackStatuses(unittest.TestCase):
         self.assertNotIn("FAILED", result[0]["final_status"])
         self.assertNotIn("COMPLETE", result[0]["final_status"])
 
+    def test_deadline_is_computed_fresh_when_this_accounts_worker_actually_starts(self):
+        # Regression test for the large-org false-timeout bug: the deadline
+        # must be computed the moment _sweep_account itself starts running -
+        # not derived from some earlier reference point, e.g. when
+        # sweep_stack_statuses was first called, before this account's
+        # worker even got a turn behind a full 32-worker pool. Calls
+        # _sweep_account directly (not through sweep_stack_statuses) twice,
+        # simulating two accounts whose workers start at very different
+        # absolute wall-clock times - as the second would if it queued
+        # behind a full worker pool while the first account's sweep was
+        # still running. Both must get an equally fair, full timeout window
+        # measured from their OWN start, not from whichever time.time()
+        # happened to read when some earlier, shared reference point was
+        # captured.
+        def run_with_fake_start_time(start_time, account_id):
+            client = MagicMock()
+            client.describe_stacks.side_effect = [
+                {"Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_IN_PROGRESS"}]},
+                {"Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_IN_PROGRESS"}]},
+                {"Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_COMPLETE"}]},
+            ]
+            record = self._record(account_id, "us-east-1", "sid-1")
+            # 3 ticks worth of "elapsed" time (1 unit per time.time() call:
+            # the deadline computation, then one check per tick), well
+            # within a real timeout=30 window measured from start_time, but
+            # far past a hypothetical stale deadline computed from t=0.
+            fake_now = iter([start_time, start_time + 1, start_time + 2])
+            with self._mgmt_session_patch(client), \
+                    patch.object(boto_common.time, "sleep"), \
+                    patch.object(boto_common.time, "time", side_effect=lambda: next(fake_now)):
+                boto_common._sweep_account(
+                    account_id, [record], sts_client=MagicMock(), management_account_id=account_id,
+                    control_role="OrganizationAccountAccessRole", poll_interval=0, timeout=30)
+            return record
+
+        # "Account A" starts near t=0 - the kind of account a shared,
+        # up-front deadline would have been computed relative to.
+        early_record = run_with_fake_start_time(0.0, "111")
+        # "Account B" starts far later in absolute time - as if it had sat
+        # queued behind a full 32-worker pool while other accounts' sweeps
+        # ran first. Under the bug this fix removed, a shared deadline
+        # captured back near t=0 (timeout=30 -> deadline=30) would already
+        # be expired by t=100_000, and this account would report TIMED_OUT
+        # on its very first check despite never having had a real chance to
+        # resolve.
+        late_record = run_with_fake_start_time(100_000.0, "222")
+
+        self.assertEqual(early_record["final_status"], "CREATE_COMPLETE")
+        self.assertEqual(late_record["final_status"], "CREATE_COMPLETE",
+                         "a late-starting account's deadline must be measured from "
+                         "its own start time, not an earlier shared reference point")
+
     def test_timed_out_preserves_a_pre_existing_status_reason(self):
         # deploy_init_stack can set a status_reason on a record that has no
         # final_status yet (e.g. "account reached READY; local
@@ -330,9 +382,12 @@ class TestSweepStackStatuses(unittest.TestCase):
         self.assertIn("contract violated", result[0]["status_reason"])
 
     def test_worker_pool_sized_to_account_count_capped_at_32(self):
-        # A fixed small worker pool would starve later-queued accounts of
-        # real time before the shared deadline, misreporting them TIMED_OUT
-        # purely due to queueing rather than anything actually being slow.
+        # Sized up to the actual account count (capped, to bound concurrent
+        # AWS API load) so as few accounts as possible ever have to queue -
+        # though even a queued account's own per-account deadline (see
+        # _sweep_account) only starts once its worker actually runs, so
+        # queueing itself is no longer a correctness risk, just something
+        # this cap still limits for API load reasons.
         seen_max_workers = []
         real_executor = boto_common.concurrent.futures.ThreadPoolExecutor
 

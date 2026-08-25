@@ -472,17 +472,31 @@ def _session_for_sweep_account(account_id, sts_client, management_account_id, co
 
 
 def _sweep_account(account_id, records, sts_client, management_account_id, control_role,
-                   poll_interval, deadline):
-    """Poll one account's stack records to resolution or the shared deadline,
-    mutating each record's final_status/status_reason in place. Runs inside a
-    worker thread submitted by sweep_stack_statuses. A failure standing up the
-    session is genuinely account-wide (nothing in this account can be polled at
-    all), so it marks every still-unresolved record of THIS account as
-    final_status="ERROR". A failure calling describe_stacks for one region is
-    isolated to that region's still-unresolved records only - a transient
-    problem in one region must not falsely mark another region's records that
-    were resolving fine. Never raises out of this function, so one bad account
-    can't take down the whole sweep."""
+                   poll_interval, timeout):
+    """Poll one account's stack records to resolution or this account's own
+    deadline, mutating each record's final_status/status_reason in place.
+    Runs inside a worker thread submitted by sweep_stack_statuses.
+
+    The deadline is computed HERE, the moment this account's own worker
+    actually starts running - not once upfront in sweep_stack_statuses and
+    shared across every account. With a worker pool capped at 32, an org
+    with more accounts than that queues the rest; a shared deadline set
+    before any worker even starts would silently eat into a queued
+    account's real polling time before it gets its first chance to check
+    anything, misreporting it TIMED_OUT purely because of queueing - not
+    because anything was actually slow. Giving every account its own fresh
+    `timeout`-second window from when it actually begins keeps this correct
+    at any org size, with no scale-dependent tuning needed.
+
+    A failure standing up the session is genuinely account-wide (nothing in
+    this account can be polled at all), so it marks every still-unresolved
+    record of THIS account as final_status="ERROR". A failure calling
+    describe_stacks for one region is isolated to that region's
+    still-unresolved records only - a transient problem in one region must
+    not falsely mark another region's records that were resolving fine.
+    Never raises out of this function, so one bad account can't take down
+    the whole sweep."""
+    deadline = time.time() + timeout
     try:
         session = _session_for_sweep_account(account_id, sts_client, management_account_id, control_role)
     except Exception as e:
@@ -660,15 +674,14 @@ def sweep_stack_statuses(stack_records, sts_client, management_account_id,
         by_account.setdefault(r["account"], []).append(r)
 
     if by_account:
-        # Measured once from sweep start, shared by every account/region - not a
-        # per-record timeout. With a small worker pool, an account queued
-        # behind others would only start polling once its turn came up, but
-        # would still be judged against this same deadline - starving it of
-        # real time to resolve and reporting it TIMED_OUT for no reason other
-        # than queueing. Sizing the pool to the actual account count (capped,
-        # to bound concurrent AWS API load) keeps every account's sweep
-        # starting immediately instead.
-        deadline = time.time() + timeout
+        # max_workers capped at 32 bounds concurrent AWS API load for very
+        # large orgs. Accounts beyond that cap queue behind the first 32 -
+        # each one still gets its own full `timeout`-second window, computed
+        # inside _sweep_account itself the moment its worker actually starts,
+        # so time spent queued is never silently deducted from its real
+        # polling time (see _sweep_account's docstring). This is what makes
+        # the sweep correct at any org size without needing to tune timeout
+        # based on account count.
         max_workers = min(32, len(by_account))
 
         futures = {}
@@ -676,7 +689,7 @@ def sweep_stack_statuses(stack_records, sts_client, management_account_id,
             for account_id, records in by_account.items():
                 future = executor.submit(
                     _sweep_account, account_id, records, sts_client,
-                    management_account_id, control_role, poll_interval, deadline)
+                    management_account_id, control_role, poll_interval, timeout)
                 futures[future] = records
             # Exiting the `with` block waits for every submitted task to finish.
 
