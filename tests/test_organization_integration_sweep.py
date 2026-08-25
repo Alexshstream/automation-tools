@@ -997,6 +997,10 @@ class TestClassifyStackStatus(unittest.TestCase):
         self.assertEqual(organization_integration._classify_stack_status("UPDATE_COMPLETE"),
                          ("succeeded", "green"))
 
+    def test_dry_run_is_its_own_bucket_not_failed(self):
+        self.assertEqual(organization_integration._classify_stack_status("DRY_RUN"),
+                         ("dry_run", "cyan"))
+
     def test_known_failure_statuses_are_failed(self):
         for status in ("CREATE_FAILED", "ROLLBACK_COMPLETE", "UPDATE_ROLLBACK_COMPLETE",
                        "UPDATE_ROLLBACK_FAILED", "SUBMIT_FAILED"):

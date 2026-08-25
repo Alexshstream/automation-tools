@@ -162,9 +162,24 @@ class TestIntegrateSubAccountDryRunEndToEnd(unittest.TestCase):
         graph_client.create_account.return_value = True
 
         cf_client = MagicMock()
+        # eks_audit_logs_auto_detect=True below must reach real EKS
+        # discovery too - a distinct 'eks' client with an actual cluster,
+        # not the same undifferentiated mock as every other service (a
+        # bare MagicMock's list_clusters()['clusters'] has __len__==0 by
+        # default, which would silently make deploy_eks_audit_logs_stacks
+        # report "no active EKS regions found" and this test would pass
+        # without ever exercising its dry_run wiring at all).
+        eks_client = MagicMock()
+        eks_client.list_clusters.return_value = {"clusters": ["fake-cluster"]}
+        lambda_client = MagicMock()
+        not_found = type("ResourceNotFoundException", (Exception,), {})
+        lambda_client.exceptions.ResourceNotFoundException = not_found
+        lambda_client.get_function.side_effect = not_found()
+
         session = MagicMock()
         session.region_name = "us-east-1"
-        session.client.return_value = cf_client
+        session.client.side_effect = lambda service, **kw: (
+            {"cloudformation": cf_client, "eks": eks_client, "lambda": lambda_client}[service])
 
         with patch.object(oi, "boto3") as oi_boto3, \
                 patch.object(oi, "get_active_regions", return_value=["us-east-1", "us-west-2"]):
@@ -174,7 +189,7 @@ class TestIntegrateSubAccountDryRunEndToEnd(unittest.TestCase):
                 "https://example.streamsec.io", ("111111111111", "acct"), sts_client, graph_client,
                 ["us-east-1", "us-west-2"], "abc123", None, None, "OrganizationAccountAccessRole",
                 "111111111111",  # org_account_id == sub_account -> no assume_role needed
-                parallel=False, response=True, eks_audit_logs_auto_detect=False, dry_run=True,
+                parallel=False, response=True, eks_audit_logs_auto_detect=True, dry_run=True,
             )
 
         # The one real side effect: account creation in StreamSecurity.
@@ -184,14 +199,74 @@ class TestIntegrateSubAccountDryRunEndToEnd(unittest.TestCase):
         graph_client.edit_regions.assert_not_called()
         graph_client.wait_for_account_connection.assert_not_called()
         # Zero AWS cost: no CloudFormation stack ever actually submitted -
-        # init + response + 2 collection stacks (us-east-1, us-west-2), all
-        # previewed only.
+        # init + response + 2 collection stacks + 2 eks_audit stacks
+        # (us-east-1, us-west-2 - the eks client above reports a cluster in
+        # every region queried), all previewed only.
         cf_client.create_stack.assert_not_called()
 
         self.assertTrue(deployed_stacks, "dry run should still return preview records")
         self.assertTrue(all(r["final_status"] == "DRY_RUN" for r in deployed_stacks))
         stack_types = sorted(r["stack_type"] for r in deployed_stacks)
-        self.assertEqual(stack_types, ["collection", "collection", "init", "response"])
+        self.assertEqual(
+            stack_types, ["collection", "collection", "eks_audit", "eks_audit", "init", "response"])
+
+
+class TestMainDryRunSummary(unittest.TestCase):
+    """No test anywhere else in the suite runs main() itself in dry_run
+    mode - _classify_stack_status("DRY_RUN") and the "N dry-run (not
+    actually created)" summary line/color in main() are only reachable
+    through the full CLI flow, not through any lower-level unit test."""
+
+    def test_dry_run_summary_counts_and_color(self):
+        import io
+        import contextlib
+
+        org_client = MagicMock()
+        org_client.list_accounts.return_value = {
+            "Accounts": [{"Id": "111111111111", "Name": "acct", "Status": "ACTIVE"}]}
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "999999999999"}
+        ec2_client = MagicMock()
+        ec2_client.describe_regions.return_value = {"Regions": [{"RegionName": "us-east-1"}]}
+
+        def boto3_client_dispatch(service, region_name=None, **kwargs):
+            return {"organizations": org_client, "sts": sts_client, "ec2": ec2_client}[service]
+
+        dry_run_record = {"account": "111111111111", "name": "acct", "region": "us-east-1",
+                          "stack_type": "init", "stack_name": "LightlyticsStack-abc",
+                          "stack_id": None, "final_status": "DRY_RUN", "status_reason": None}
+
+        color_calls = []
+        real_color = boto_common.color
+
+        def spy_color(text, c):
+            color_calls.append((text, c))
+            return real_color(text, c)
+
+        with patch.object(oi, "boto3") as mock_boto3, \
+                patch.object(oi, "GraphCommon", return_value=MagicMock()), \
+                patch.object(oi, "integrate_sub_account", return_value=[dry_run_record]), \
+                patch.object(oi, "color", side_effect=spy_color), \
+                patch("builtins.input", return_value="yes"):
+            mock_boto3.client.side_effect = boto3_client_dispatch
+            stdout_buf = io.StringIO()
+            with contextlib.redirect_stdout(stdout_buf):
+                oi.main(
+                    environment_url="https://example.streamsec.io",
+                    ll_username=None, ll_password=None, aws_profile_name=None,
+                    accounts="111111111111", parallel=None,
+                    ws_id="ws-1", api_token="fake-token", dry_run=True,
+                )
+
+        output = stdout_buf.getvalue()
+        self.assertIn("1 dry-run (not actually created)", output)
+        self.assertIn("0 succeeded, 0 failed, 0 timed out, 0 errored", output)
+
+        summary_calls = [c for c in color_calls if "dry-run (not actually created)" in c[0]]
+        self.assertEqual(len(summary_calls), 1)
+        self.assertEqual(summary_calls[0][1], "cyan",
+                         "a pure dry-run summary (no real successes/failures) must print cyan, "
+                         "not fall through to red/green")
 
 
 if __name__ == "__main__":
