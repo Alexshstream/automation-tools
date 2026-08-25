@@ -379,7 +379,7 @@ def deploy_init_stack(account_information, graph_client, sub_account, sub_accoun
         # previews) should still be allowed to run instead of aborting here
         # the way a genuine SUBMIT_FAILED does. There's also no real
         # stack/account-connection to wait on below, dry run or not.
-        return early_exit_record.get("final_status") == "DRY_RUN", early_exit_record
+        return dry_run, early_exit_record
 
     record = _stack_record(sub_account, sub_account_session.region_name, "init", stack_name, sub_account_stack_id)
 

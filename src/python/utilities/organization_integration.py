@@ -232,7 +232,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
             print(color(summary, "red"))
         elif timed_out_count:
             print(color(summary, "yellow"))
-        elif dry_run_count and not succeeded_count:
+        elif dry_run_count:
             print(color(summary, "cyan"))
         else:
             print(color(summary, "green"))
