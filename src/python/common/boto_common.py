@@ -121,13 +121,21 @@ def _stack_record(sub_account, region, stack_type, stack_name, stack_id,
     return record
 
 
-def _try_create_stack(sub_account, region, stack_type, stack_name, cf_client, stack_creation_payload):
+def _try_create_stack(sub_account, region, stack_type, stack_name, cf_client, stack_creation_payload, dry_run=False):
     """Submit a CloudFormation stack. Returns (stack_id, None) on success, or
-    (None, submit_failed_record) on failure - the caller should
-    return/append submit_failed_record and skip further processing for this
-    stack when it is not None. Shared by every deploy_* helper so this guard
+    (None, record) when nothing was actually submitted - either a
+    submit_failed_record (final_status=SUBMIT_FAILED) or, when dry_run is
+    set, a dry_run_record (final_status=DRY_RUN). Either way the caller
+    should return/append that record and skip further processing (waiting,
+    sweeping) for this stack. Shared by every deploy_* helper so this guard
     can't accidentally be missing from one of them (as happened with
     deploy_init_stack and deploy_collection_stack before this existed)."""
+    if dry_run:
+        print(color(f"Account: {sub_account[0]} | DRY RUN: would submit {stack_type} stack "
+                    f"'{stack_name}' in {region}", "cyan"))
+        return None, _stack_record(
+            sub_account, region, stack_type, stack_name, None,
+            final_status="DRY_RUN", status_reason=None)
     try:
         stack_id = cf_client.create_stack(**stack_creation_payload)["StackId"]
         print(color(f"Account: {sub_account[0]} | {stack_type} stack {stack_id} deploying", "blue"))
@@ -157,7 +165,8 @@ def _try_wait_for_cloudformation(sub_account, region, stack_type, stack_id, cf_c
 
 
 def deploy_all_collection_stacks(
-        active_regions, sub_account_session, random_int, account_information, sub_account, custom_tags=None):
+        active_regions, sub_account_session, random_int, account_information, sub_account, custom_tags=None,
+        dry_run=False):
     print(color(
         f"Account: {sub_account[0]} | Adding collection CFT stack for realtime events for each region in parallel "
         f"(Max 8 workers)", color="blue"))
@@ -170,7 +179,8 @@ def deploy_all_collection_stacks(
         # Iterate over active_regions and submit each task to the executor
         for region in active_regions:
             future = executor.submit(deploy_collection_stack, account_information,
-                                     sub_account_session, sub_account, region, random_int, custom_tags, False)
+                                     sub_account_session, sub_account, region, random_int, custom_tags, False,
+                                     dry_run)
             futures.append((region, future))
     # Collect the results (stack records) from all the tasks. A region whose
     # create_stack call itself failed must not discard the records of sibling
@@ -196,7 +206,8 @@ def deploy_all_collection_stacks(
 
 
 def deploy_collection_stack(
-        account_information, sub_account_session, sub_account, region, random_int, custom_tags, wait=True):
+        account_information, sub_account_session, sub_account, region, random_int, custom_tags, wait=True,
+        dry_run=False):
     # Existing code inside the for loop
     print(color(f"Account: {sub_account[0]} | Adding collection CFT stack for {region}", "blue"))
     region_client = sub_account_session.client('cloudformation', region_name=region)
@@ -208,10 +219,10 @@ def deploy_collection_stack(
     # solely on the caller's future.result() handling - a future direct
     # caller that bypasses deploy_all_collection_stacks still gets the
     # SUBMIT_FAILED protection instead of an unguarded raise.
-    collection_stack_id, submit_failed = _try_create_stack(
-        sub_account, region, "collection", stack_name, region_client, stack_creation_payload)
-    if submit_failed:
-        return submit_failed
+    collection_stack_id, early_exit_record = _try_create_stack(
+        sub_account, region, "collection", stack_name, region_client, stack_creation_payload, dry_run=dry_run)
+    if early_exit_record:
+        return early_exit_record
 
     if wait:
         print(color(f"Account: {sub_account[0]} | Waiting for the stack to finish deploying successfully", "blue"))
@@ -220,7 +231,8 @@ def deploy_collection_stack(
     return _stack_record(sub_account, region, "collection", stack_name, collection_stack_id)
 
 def deploy_response_stack(
-        environment_url, account_information, sub_account_session, sub_account, region, random_int, custom_tags, response_exclude_runbooks, wait=True):
+        environment_url, account_information, sub_account_session, sub_account, region, random_int, custom_tags, response_exclude_runbooks, wait=True,
+        dry_run=False):
     print(color(f"Account: {sub_account[0]} | Adding response CFT stack for {region}", "blue"))
     region_client = sub_account_session.client('cloudformation', region_name=region)
     
@@ -256,10 +268,10 @@ def deploy_response_stack(
         stack_name,
         os.environ.get("STREAM_RESPONSE_CFT_URL", f"https://prod-lightlytics-public-cloudformation.s3.amazonaws.com/stream-security-remediation-latest-{region}.yaml"), custom_tags=custom_tags , params=params)
 
-    response_stack_id, submit_failed = _try_create_stack(
-        sub_account, region, "response", stack_name, region_client, stack_creation_payload)
-    if submit_failed:
-        return submit_failed
+    response_stack_id, early_exit_record = _try_create_stack(
+        sub_account, region, "response", stack_name, region_client, stack_creation_payload, dry_run=dry_run)
+    if early_exit_record:
+        return early_exit_record
 
     if wait:
         print(color(f"Account: {sub_account[0]} | Waiting for the stack to finish deploying successfully", "blue"))
@@ -268,7 +280,8 @@ def deploy_response_stack(
     return _stack_record(sub_account, region, "response", stack_name, response_stack_id)
 
 def deploy_eks_audit_logs_stacks(
-        environment_url, sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=True):
+        environment_url, sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=True,
+        dry_run=False):
     records = []
     if not eks_audit_logs_regions:
         eks_audit_logs_regions = get_active_eks_regions(sub_account_session, sub_account_information["cloud_regions"])
@@ -322,10 +335,11 @@ def deploy_eks_audit_logs_stacks(
             stack_name,
             os.environ.get("STREAM_EKS_AUDIT_LOGS_CFT_URL", f"https://public-lightlytics-cft.s3.amazonaws.com/eks-audit-collector-latest.yaml"), custom_tags=custom_tags, params=params)
 
-        eks_audit_logs_stack_id, submit_failed = _try_create_stack(
-            sub_account, region, "eks_audit", stack_name, region_cloudformation_client, stack_creation_payload)
-        if submit_failed:
-            records.append(submit_failed)
+        eks_audit_logs_stack_id, early_exit_record = _try_create_stack(
+            sub_account, region, "eks_audit", stack_name, region_cloudformation_client, stack_creation_payload,
+            dry_run=dry_run)
+        if early_exit_record:
+            records.append(early_exit_record)
             continue
 
         if wait:
@@ -338,7 +352,7 @@ def deploy_eks_audit_logs_stacks(
     return records
 
 def deploy_init_stack(account_information, graph_client, sub_account, sub_account_session, random_int, wait=True,
-                      custom_tags=None):
+                      custom_tags=None, dry_run=False):
     """Returns (success: bool, record: dict) - always a 2-tuple, which is
     always truthy. A caller written against the old bare-bool return (e.g.
     `if not deploy_init_stack(...)`) must unpack it explicitly; a truthiness
@@ -356,10 +370,16 @@ def deploy_init_stack(account_information, graph_client, sub_account, sub_accoun
 
     # Self-guarded (like every sibling deploy_* function), matching this
     # function's own documented "always returns a 2-tuple" contract.
-    sub_account_stack_id, submit_failed = _try_create_stack(
-        sub_account, sub_account_session.region_name, "init", stack_name, cf, stack_creation_payload)
-    if submit_failed:
-        return False, submit_failed
+    sub_account_stack_id, early_exit_record = _try_create_stack(
+        sub_account, sub_account_session.region_name, "init", stack_name, cf, stack_creation_payload,
+        dry_run=dry_run)
+    if early_exit_record:
+        # DRY_RUN is not a failure - nothing was actually submitted, on
+        # purpose, so the rest of the flow (region detection, response/EKS
+        # previews) should still be allowed to run instead of aborting here
+        # the way a genuine SUBMIT_FAILED does. There's also no real
+        # stack/account-connection to wait on below, dry run or not.
+        return early_exit_record.get("final_status") == "DRY_RUN", early_exit_record
 
     record = _stack_record(sub_account, sub_account_session.region_name, "init", stack_name, sub_account_stack_id)
 

@@ -29,13 +29,21 @@ def _classify_stack_status(status):
         return "timed_out", "yellow"
     if status == "ERROR":
         return "errored", "red"
+    if status == "DRY_RUN":
+        return "dry_run", "cyan"
     if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
         return "succeeded", "green"
     return "failed", "red"
 
 
 def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, parallel,
-         ws_id=None, custom_tags=None, regions_to_integrate=None, control_role="OrganizationAccountAccessRole", response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None, eks_audit_logs_auto_detect=False, api_token=None):
+         ws_id=None, custom_tags=None, regions_to_integrate=None, control_role="OrganizationAccountAccessRole", response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None, eks_audit_logs_auto_detect=False, api_token=None, dry_run=False):
+
+    if dry_run:
+        print(color("DRY RUN: no CloudFormation stacks will actually be created, and region "
+                    "updates are only previewed. A new account still gets created for real in "
+                    "StreamSecurity (no AWS cost) so the preview reflects real backend data "
+                    "(template URLs, tokens, etc.).", "cyan"))
 
     try:
         if not environment_url:
@@ -144,7 +152,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                     integrate_sub_account,
                     environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
                     control_role, org_account_id, parallel, response, response_region, response_exclude_runbooks, eks_audit_logs, eks_audit_logs_regions,
-                    eks_audit_logs_auto_detect
+                    eks_audit_logs_auto_detect, dry_run
                 ): sub_account for sub_account in sub_accounts
             }
             for future in concurrent.futures.as_completed(future_to_account):
@@ -169,7 +177,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                     environment_url, sub_account, sts_client, graph_client, regions, random_int,
                     custom_tags, regions_to_integrate, control_role, org_account_id, response=response, response_region=response_region, response_exclude_runbooks=response_exclude_runbooks,
                     eks_audit_logs=eks_audit_logs, eks_audit_logs_regions=eks_audit_logs_regions,
-                    eks_audit_logs_auto_detect=eks_audit_logs_auto_detect)
+                    eks_audit_logs_auto_detect=eks_audit_logs_auto_detect, dry_run=dry_run)
                 if account_deployed_stacks:
                     all_deployed_stacks.extend(account_deployed_stacks)
             except Exception as e:
@@ -189,7 +197,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         swept_stacks = sweep_stack_statuses(
             all_deployed_stacks, sts_client, org_account_id, control_role=control_role)
 
-        counts = {"succeeded": 0, "failed": 0, "timed_out": 0, "errored": 0}
+        counts = {"succeeded": 0, "failed": 0, "timed_out": 0, "errored": 0, "dry_run": 0}
         for r in swept_stacks:
             # Defensive .get() with a fallback, not direct indexing: every
             # record reaching here is SUPPOSED to carry a final_status (either
@@ -213,15 +221,19 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         failed_count = counts["failed"]
         timed_out_count = counts["timed_out"]
         errored_count = counts["errored"]
+        dry_run_count = counts["dry_run"]
 
         summary = (
             f"Stack sweep summary ({len(swept_stacks)} stack(s) total): "
             f"{succeeded_count} succeeded, {failed_count} failed, "
-            f"{timed_out_count} timed out, {errored_count} errored")
+            f"{timed_out_count} timed out, {errored_count} errored, "
+            f"{dry_run_count} dry-run (not actually created)")
         if failed_count or errored_count:
             print(color(summary, "red"))
         elif timed_out_count:
             print(color(summary, "yellow"))
+        elif dry_run_count and not succeeded_count:
+            print(color(summary, "cyan"))
         else:
             print(color(summary, "green"))
     elif not failures:
@@ -233,7 +245,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
 def integrate_sub_account(
         environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate, control_role,
         org_account_id, parallel=False, response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None,
-        eks_audit_logs_auto_detect=False):
+        eks_audit_logs_auto_detect=False, dry_run=False):
     print(color(f"Account: {sub_account[0]} | Starting integration", color="blue"))
     deployed_stacks = []
     try:
@@ -273,7 +285,8 @@ def integrate_sub_account(
                 remediation = response_info.get("remediation")
                 if (remediation is None or remediation.get("status") is None) and response:
                     response_record = deploy_response_stack(
-                        environment_url ,sub_account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
+                        environment_url ,sub_account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=False,
+                        dry_run=dry_run)
                     if response_record:
                         deployed_stacks.append(response_record)
 
@@ -303,7 +316,8 @@ def integrate_sub_account(
                         {**sub_account_information, "cloud_regions": list(potential_regions)}
                         if eks_audit_logs_auto_detect else sub_account_information)
                     eks_records = deploy_eks_audit_logs_stacks(
-                        environment_url, eks_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
+                        environment_url, eks_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False,
+                        dry_run=dry_run)
                     if eks_records:
                         deployed_stacks.extend(eks_records)
 
@@ -312,7 +326,7 @@ def integrate_sub_account(
                     potential_regions = list(set(potential_regions))
                     print(color(
                         f"Account: {sub_account[0]} | Regions are different, updating to {potential_regions}", "blue"))
-                    if not update_regions(graph_client, sub_account, potential_regions, not parallel):
+                    if not update_regions(graph_client, sub_account, potential_regions, not parallel, dry_run=dry_run):
                         err_msg = f"Account: {sub_account[0]} | Something went wrong with regions update"
                         print(color(err_msg, "red"))
                         raise Exception(err_msg)
@@ -329,7 +343,7 @@ def integrate_sub_account(
                                 f"adding support for {regions_to_integrate}", "blue"))
                     collection_records = deploy_all_collection_stacks(
                         regions_to_integrate, sub_account_session, random_int, sub_account_information, sub_account,
-                        custom_tags=custom_tags)
+                        custom_tags=custom_tags, dry_run=dry_run)
                     if collection_records:
                         deployed_stacks.extend(collection_records)
                 else:
@@ -360,7 +374,7 @@ def integrate_sub_account(
         # Deploying the initial integration stack
         init_ok, init_record = deploy_init_stack(
                 account_information, graph_client, sub_account, sub_account_session, random_int, not parallel,
-                custom_tags=custom_tags)
+                custom_tags=custom_tags, dry_run=dry_run)
         if init_record:
             deployed_stacks.append(init_record)
         if not init_ok:
@@ -381,7 +395,8 @@ def integrate_sub_account(
 
         if response:
             response_record = deploy_response_stack(
-                environment_url, account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=False)
+                environment_url, account_information, sub_account_session, sub_account, response_region, random_int, custom_tags, response_exclude_runbooks, wait=False,
+                dry_run=dry_run)
             if response_record:
                 deployed_stacks.append(response_record)
 
@@ -400,19 +415,21 @@ def integrate_sub_account(
             regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
             eks_records = deploy_eks_audit_logs_stacks(
                 environment_url, {**account_information, "cloud_regions": active_regions},
-                sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False)
+                sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False,
+                dry_run=dry_run)
             if eks_records:
                 deployed_stacks.extend(eks_records)
 
         # Updating the regions in StreamSecurity and waiting
-        if not update_regions(graph_client, sub_account, active_regions, not parallel):
+        if not update_regions(graph_client, sub_account, active_regions, not parallel, dry_run=dry_run):
             err_msg = f"Account: {sub_account[0]} | Something went wrong with regions update"
             print(color(err_msg, "red"))
             raise Exception(err_msg)
 
         # Deploying collections stacks for all regions
         collection_records = deploy_all_collection_stacks(
-            active_regions, sub_account_session, random_int, account_information, sub_account, custom_tags=custom_tags)
+            active_regions, sub_account_session, random_int, account_information, sub_account, custom_tags=custom_tags,
+            dry_run=dry_run)
         if collection_records:
             deployed_stacks.extend(collection_records)
 
@@ -429,7 +446,19 @@ def integrate_sub_account(
         raise wrapped
 
 
-def update_regions(graph_client, sub_account, active_regions, wait=True):
+def update_regions(graph_client, sub_account, active_regions, wait=True, dry_run=False):
+    if dry_run:
+        # In a real run this account's status would already be READY by now
+        # (the just-created init stack reported back to StreamSecurity) -
+        # but dry_run never actually created that stack, so the real polling
+        # loop below would spin until its 5-minute timeout waiting for a
+        # transition that will never happen. edit_regions() itself is
+        # skipped too, since there's no real init stack for the backend to
+        # have associated the account with yet.
+        print(color(f"Account: {sub_account[0]} | DRY RUN: would update regions to "
+                    f"{active_regions}", "cyan"))
+        return True
+
     print(color(f"Account: {sub_account[0]} | Wait until account is initialized", "blue"))
     count = 0
     while True:
@@ -502,10 +531,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eks_audit_logs_auto_detect", help="Auto-detect EKS clusters and deploy audit logs only where found",
         action="store_true", required=False)
+    parser.add_argument(
+        "--dry_run",
+        help="Preview only - skip every CloudFormation stack creation (zero AWS cost). "
+             "Still creates the account for real in StreamSecurity so the preview reflects "
+             "real backend data; region updates are also preview-only.",
+        action="store_true", required=False)
     args = parser.parse_args()
     main(args.environment_url, args.environment_user_name, args.environment_password,
          args.aws_profile_name, args.accounts, args.parallel,
          ws_id=args.ws_id, custom_tags=args.custom_tags, regions_to_integrate=args.regions,
          control_role=args.control_role, response=args.response, response_region=args.response_region, response_exclude_runbooks=args.response_exclude_runbooks,
          eks_audit_logs=args.eks_audit_logs, eks_audit_logs_regions=args.eks_audit_logs_regions,
-         eks_audit_logs_auto_detect=args.eks_audit_logs_auto_detect, api_token=args.api_token)
+         eks_audit_logs_auto_detect=args.eks_audit_logs_auto_detect, api_token=args.api_token,
+         dry_run=args.dry_run)
