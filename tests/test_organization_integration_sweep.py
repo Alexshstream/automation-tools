@@ -702,6 +702,20 @@ class TestDeployInitStackReturnShape(unittest.TestCase):
             "stack_id": "arn:aws:cloudformation:us-east-1:123456789012:stack/LightlyticsStack-42/uuid",
         })
         wfc.assert_not_called()
+
+    def test_cloudformation_client_uses_adaptive_retry_config(self):
+        # wait_for_cloudformation polls this same client every few seconds;
+        # under --parallel, many accounts' workers doing that concurrently
+        # without adaptive retries risks exhausting boto3's default retry
+        # budget on a throttled DescribeStacks call, surfacing as a false
+        # stack-deployment failure for a stack that was actually fine.
+        account_information, sub_account, session, cf_client, graph_client = self._setup()
+
+        with patch.object(boto_common, "wait_for_cloudformation"):
+            boto_common.deploy_init_stack(
+                account_information, graph_client, sub_account, session, 42, wait=False)
+
+        session.client.assert_called_once_with("cloudformation", config=boto_common.LAMBDA_CLIENT_CONFIG)
         graph_client.wait_for_account_connection.assert_not_called()
 
     def test_wait_true_ready_returns_true_and_record(self):

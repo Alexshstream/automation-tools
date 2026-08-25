@@ -58,7 +58,12 @@ def wait_for_cloudformation(sub_account, cft_id, cf_client, timeout=240):
             print(color(err_msg, "red"))
             raise Exception(err_msg)
         else:
-            time.sleep(1)
+            # 5s, not 1s: under --parallel, many accounts' workers all
+            # polling DescribeStacks concurrently at 1 call/sec each adds
+            # up to real throttling risk even with the adaptive retry
+            # config above - a less aggressive poll cadence reduces how
+            # often that risk is even exercised in the first place.
+            time.sleep(5)
     if dt_diff >= timeout:
         print(color(f"Account: {sub_account[0]} | Timed out before stack has been created/deleted", "red"))
         return False
@@ -368,8 +373,18 @@ def deploy_init_stack(account_information, graph_client, sub_account, sub_accoun
     sub_account_template_url = account_information["template_url"]
     print(color(f"Account: {sub_account[0]} | Finished fetching information", "green"))
 
-    # Initializing "cloudformation" boto client
-    cf = sub_account_session.client('cloudformation')
+    # Initializing "cloudformation" boto client. config=LAMBDA_CLIENT_CONFIG
+    # (adaptive retry, reused here only for its retry/timeout settings, not
+    # anything Lambda-specific - same reuse this file already does for the
+    # sweep's own CloudFormation clients) - wait_for_cloudformation below
+    # polls this client every few seconds; under --parallel, many accounts'
+    # workers doing that concurrently without adaptive retries risks
+    # exhausting boto3's default retry budget on a throttled DescribeStacks
+    # call, which would surface as a false stack-deployment failure for a
+    # stack that was actually fine - the exact class of bug this function
+    # was already fixed for once (see the describe_stacks-by-ID change
+    # above).
+    cf = sub_account_session.client('cloudformation', config=LAMBDA_CLIENT_CONFIG)
 
     print(color(f"Account: {sub_account[0]} | Creating the CFT stack using Boto", "blue"))
     stack_name = f"LightlyticsStack-{random_int}"

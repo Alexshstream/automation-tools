@@ -463,16 +463,18 @@ class TestOrgScaleSimulation(unittest.TestCase):
         with self.subTest(account="9: READY, new region, has EKS"):
             # already READY, region set changed, has EKS - no init stack
             # (already integrated), the new region's collection stack, and
-            # (regression check for the READY-account potential_regions
-            # fix) an eks_audit stack in us-west-2 - a region NOT in this
-            # account's registered cloud_regions (["us-east-1"]) but which
-            # is real and active per get_active_regions(). Under the old
-            # --eks_audit_logs flag this would have been missed entirely
-            # (it only scans cloud_regions); --eks_audit_logs_auto_detect
-            # must catch it.
+            # (regression check for --eks_audit_logs_auto_detect scanning
+            # every org-enabled region, not just active/registered ones)
+            # eks_audit stacks in ALL THREE candidate regions, including
+            # eu-west-1 - not active (no EC2 instances there) and not in
+            # this account's registered cloud_regions (["us-east-1"])
+            # either. Under the old --eks_audit_logs flag this would have
+            # been missed entirely (it only scans cloud_regions);
+            # --eks_audit_logs_auto_detect must catch it.
             self.assertNotIn("100000000009", failed_accounts)
             self.assertEqual(stacks_of("100000000009"), [
                 ("collection", "us-west-2", "CREATE_COMPLETE"),
+                ("eks_audit", "eu-west-1", "CREATE_COMPLETE"),
                 ("eks_audit", "us-east-1", "CREATE_COMPLETE"),
                 ("eks_audit", "us-west-2", "CREATE_COMPLETE"),
                 ("response", "us-east-1", "CREATE_COMPLETE"),

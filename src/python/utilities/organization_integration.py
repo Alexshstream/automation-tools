@@ -309,26 +309,25 @@ def integrate_sub_account(
                 # Deploying EKS audit logs if enabled. eks_audit_logs_auto_detect
                 # forces auto-detection (regions=None) regardless of
                 # eks_audit_logs_regions - it's the explicit "just detect and
-                # deploy where EKS clusters are found" mode, so it must scan
-                # the union of potential_regions (real EC2-instance-detected
-                # active regions, just computed above) AND current_regions
-                # (the account's already-registered regions). potential_regions
-                # alone would be narrower than plain --eks_audit_logs' own
-                # cloud_regions-based scan for a Fargate-only EKS cluster (no
-                # EC2 instances, so get_active_regions never reports that
-                # region as active) or any registered region with no
-                # currently-running instances - both real, both must still be
-                # scanned. sub_account_information["cloud_regions"] itself
-                # isn't used directly since it may be stale relative to
-                # current_regions if this account's info was fetched earlier
-                # in the run; current_regions is read fresh, right above.
-                # Plain --eks_audit_logs keeps its existing behavior
-                # (scanning cloud_regions only) unchanged.
+                # deploy where EKS clusters are found" mode, so it scans
+                # EVERY region enabled for this org (the same `regions` this
+                # function already receives), not just the EC2-instance-based
+                # potential_regions or the account's currently-registered
+                # cloud_regions. Either of those alone would miss a
+                # Fargate-only EKS cluster (no EC2 instances at all, so
+                # get_active_regions never reports that region as "active")
+                # in a region the account isn't otherwise registered for.
+                # get_active_eks_regions does its own real, authoritative
+                # list_clusters() check per region and already isolates a
+                # single region's failure from the rest - one extra API call
+                # per region not otherwise active is a small price for not
+                # silently missing real clusters. Plain --eks_audit_logs
+                # keeps its existing behavior (scanning cloud_regions only)
+                # unchanged.
                 if eks_audit_logs or eks_audit_logs_auto_detect:
                     regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
-                    eks_scan_regions = sorted(set(potential_regions) | set(current_regions))
                     eks_account_information = (
-                        {**sub_account_information, "cloud_regions": eks_scan_regions}
+                        {**sub_account_information, "cloud_regions": regions}
                         if eks_audit_logs_auto_detect else sub_account_information)
                     eks_records = deploy_eks_audit_logs_stacks(
                         environment_url, eks_account_information, sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False,
@@ -421,15 +420,23 @@ def integrate_sub_account(
             # session region) - deploy_eks_audit_logs_stacks' own auto-detect
             # fallback would scan only that if given account_information
             # as-is, silently missing EKS clusters in any other active
-            # region. active_regions (just computed above via real EC2
-            # instance detection across all candidate regions) is what
-            # should be scanned instead.
+            # region.
             # eks_audit_logs_auto_detect forces auto-detection (regions=None)
             # regardless of eks_audit_logs_regions - it's the explicit "just
-            # detect and deploy where EKS clusters are found" mode.
+            # detect and deploy where EKS clusters are found" mode, so it
+            # scans EVERY region enabled for this org (`regions`), not just
+            # active_regions (EC2-instance-based) - active_regions alone
+            # would still miss a Fargate-only EKS cluster in a region with
+            # no EC2 instances at all. get_active_eks_regions does its own
+            # real, authoritative list_clusters() check per region and
+            # already isolates a single region's failure from the rest.
+            # Plain --eks_audit_logs keeps scanning active_regions (the fix
+            # already shipped for it - real EC2-instance detection instead
+            # of the stale account_information["cloud_regions"] above).
             regions_arg = None if eks_audit_logs_auto_detect else eks_audit_logs_regions
+            eks_scan_regions = regions if eks_audit_logs_auto_detect else active_regions
             eks_records = deploy_eks_audit_logs_stacks(
-                environment_url, {**account_information, "cloud_regions": active_regions},
+                environment_url, {**account_information, "cloud_regions": eks_scan_regions},
                 sub_account_session, sub_account, regions_arg, random_int, custom_tags, wait=False,
                 dry_run=dry_run)
             if eks_records:

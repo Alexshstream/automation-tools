@@ -22,7 +22,7 @@ from src.python.utilities import organization_integration as oi
 class TestEksAuditLogsActiveRegions(unittest.TestCase):
     def _run_brand_new_account(self, active_regions, backend_cloud_regions,
                                eks_audit_logs=True, eks_audit_logs_regions=None,
-                               eks_audit_logs_auto_detect=False):
+                               eks_audit_logs_auto_detect=False, org_regions=None):
         sts_client = MagicMock()
         graph_client = MagicMock()
         # First get_accounts() call (existence check) -> IndexError, so
@@ -50,7 +50,8 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
 
             oi.integrate_sub_account(
                 "https://example.streamsec.io", ("111111111111", "acct"), sts_client, graph_client,
-                ["us-east-1", "us-west-2"], 12345678, None, None, "OrganizationAccountAccessRole",
+                org_regions or ["us-east-1", "us-west-2"], 12345678, None, None,
+                "OrganizationAccountAccessRole",
                 "111111111111",  # org_account_id == sub_account -> no assume_role needed
                 parallel=False, response=False, eks_audit_logs=eks_audit_logs,
                 eks_audit_logs_regions=eks_audit_logs_regions,
@@ -90,19 +91,28 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
         self.assertEqual(passed_account_information["lightlytics_collection_token"], "tok")
         self.assertEqual(passed_account_information["cloud_account_id"], "111111111111")
 
-    def test_auto_detect_flag_alone_triggers_deploy_with_active_regions(self):
+    def test_auto_detect_flag_alone_triggers_deploy_with_every_org_enabled_region(self):
         # --eks_audit_logs_auto_detect on its own (no --eks_audit_logs) must
-        # still trigger detection+deploy, scanning active_regions.
+        # still trigger detection+deploy, and must scan EVERY region enabled
+        # for the org (the `regions` parameter), not just active_regions
+        # (EC2-instance-based) - active_regions alone would miss a
+        # Fargate-only EKS cluster in a region with no EC2 instances at all.
+        # get_active_eks_regions does its own real, authoritative
+        # list_clusters() check per region, so scanning everything is safe.
         mock_eks = self._run_brand_new_account(
             active_regions=["us-east-1", "us-west-2"],
             backend_cloud_regions=["us-east-1"],
             eks_audit_logs=False, eks_audit_logs_regions=None,
             eks_audit_logs_auto_detect=True,
+            org_regions=["us-east-1", "us-west-2", "eu-west-1"],
         )
         mock_eks.assert_called_once()
         passed_account_information = mock_eks.call_args[0][1]
         self.assertEqual(
-            sorted(passed_account_information["cloud_regions"]), ["us-east-1", "us-west-2"])
+            sorted(passed_account_information["cloud_regions"]),
+            ["eu-west-1", "us-east-1", "us-west-2"],
+            "auto-detect must scan every org-enabled region, including one not "
+            "reported active by get_active_regions")
         # regions_arg (5th positional) must be None so
         # deploy_eks_audit_logs_stacks runs its own auto-detection.
         self.assertIsNone(mock_eks.call_args[0][4])
@@ -143,7 +153,7 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
 
     def _run_ready_account(self, potential_regions, registered_cloud_regions,
                            eks_audit_logs=True, eks_audit_logs_regions=None,
-                           eks_audit_logs_auto_detect=False):
+                           eks_audit_logs_auto_detect=False, org_regions=None):
         sts_client = MagicMock()
         graph_client = MagicMock()
         graph_client.get_accounts.return_value = [
@@ -166,7 +176,8 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
 
             oi.integrate_sub_account(
                 "https://example.streamsec.io", ("111111111111", "acct"), sts_client, graph_client,
-                ["us-east-1", "us-west-2"], 12345678, None, None, "OrganizationAccountAccessRole",
+                org_regions or ["us-east-1", "us-west-2"], 12345678, None, None,
+                "OrganizationAccountAccessRole",
                 "111111111111",  # org_account_id == sub_account -> no assume_role needed
                 parallel=False, response=False, eks_audit_logs=eks_audit_logs,
                 eks_audit_logs_regions=eks_audit_logs_regions,
@@ -175,44 +186,31 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
 
         return mock_eks
 
-    def test_ready_account_auto_detect_uses_potential_regions_not_stale_registered_regions(self):
-        # Already-READY account whose real active AWS regions (potential_regions,
-        # via get_active_regions) have grown since last onboarding -
-        # --eks_audit_logs_auto_detect must scan the fresh set too, not just
-        # the account's currently-registered cloud_regions.
+    def test_ready_account_auto_detect_scans_every_org_enabled_region(self):
+        # --eks_audit_logs_auto_detect must scan EVERY region enabled for
+        # the org (the `regions` parameter this function already receives),
+        # not just get_active_regions()'s EC2-instance-based subset or the
+        # account's currently-registered cloud_regions - either alone would
+        # miss a Fargate-only EKS cluster (no EC2 instances at all) in a
+        # region the account isn't otherwise active or registered in.
+        # get_active_eks_regions does its own real, authoritative
+        # list_clusters() check per region, so scanning everything is safe
+        # and cheap, not just "broader for its own sake".
         mock_eks = self._run_ready_account(
             potential_regions=["us-east-1", "us-west-2"],
             registered_cloud_regions=["us-east-1"],
             eks_audit_logs=False, eks_audit_logs_regions=None,
             eks_audit_logs_auto_detect=True,
-        )
-        mock_eks.assert_called_once()
-        passed_account_information = mock_eks.call_args[0][1]
-        self.assertEqual(
-            sorted(passed_account_information["cloud_regions"]), ["us-east-1", "us-west-2"],
-            "auto-detect must scan potential_regions in addition to registered cloud_regions")
-        self.assertIsNone(mock_eks.call_args[0][4])
-
-    def test_ready_account_auto_detect_still_scans_a_registered_region_with_no_running_instances(self):
-        # A registered region can host a real EKS cluster (e.g. Fargate-only,
-        # or simply no EC2 instances running right now) even though
-        # get_active_regions() - which only looks for running EC2 instances -
-        # would never report it as "active". potential_regions alone would
-        # silently drop this region from the EKS scan; the union with
-        # current_regions (the account's real registered regions) must not.
-        mock_eks = self._run_ready_account(
-            potential_regions=["us-east-1", "us-west-2"],
-            registered_cloud_regions=["us-east-1", "eu-west-1"],
-            eks_audit_logs=False, eks_audit_logs_regions=None,
-            eks_audit_logs_auto_detect=True,
+            org_regions=["us-east-1", "us-west-2", "eu-west-1"],
         )
         mock_eks.assert_called_once()
         passed_account_information = mock_eks.call_args[0][1]
         self.assertEqual(
             sorted(passed_account_information["cloud_regions"]),
             ["eu-west-1", "us-east-1", "us-west-2"],
-            "a registered region with no currently-running EC2 instances (e.g. "
-            "Fargate-only EKS) must still be scanned, not silently dropped")
+            "auto-detect must scan every org-enabled region, including one neither "
+            "active (no EC2 instances) nor registered")
+        self.assertIsNone(mock_eks.call_args[0][4])
 
     def test_ready_account_plain_eks_audit_logs_keeps_existing_behavior(self):
         # Plain --eks_audit_logs (no auto-detect) must keep scanning the
