@@ -36,6 +36,25 @@ def _classify_stack_status(status):
     return "failed", "red"
 
 
+def _warn_unregistered_eks_regions(sub_account, eks_records, registered_regions):
+    """The collection backend ingests EKS audit events from any region (the
+    endpoint authenticates by collection token, not by registered region),
+    but a cluster in a region the account isn't registered for never enters
+    the asset inventory - its events get stored with raw names instead of
+    being linked to inventory resources. A real capability gap the operator
+    can close with --regions, so say it at deploy time instead of leaving it
+    to be discovered in the UI. SUBMIT_FAILED records deployed nothing, so
+    they're excluded (their failure is already reported on its own)."""
+    registered = set(registered_regions)
+    deployed = {r["region"] for r in eks_records
+                if r.get("final_status") != "SUBMIT_FAILED"}
+    for region in sorted(deployed - registered):
+        print(color(
+            f"Account: {sub_account[0]} | EKS audit collector deployed in {region}, which is "
+            f"not a registered region for this account - events will be ingested but not "
+            f"linked to inventory. Add it with --regions for full enrichment.", "yellow"))
+
+
 def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, parallel,
          ws_id=None, custom_tags=None, regions_to_integrate=None, control_role="OrganizationAccountAccessRole", response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None, eks_audit_logs_auto_detect=False, api_token=None, dry_run=False):
 
@@ -334,6 +353,14 @@ def integrate_sub_account(
                         dry_run=dry_run)
                     if eks_records:
                         deployed_stacks.extend(eks_records)
+                        # Compare against the account's FINAL registered set:
+                        # the update just below registers the union of
+                        # potential and current regions (or leaves current as
+                        # is when they already match, in which case the union
+                        # is the same set).
+                        _warn_unregistered_eks_regions(
+                            sub_account, eks_records,
+                            set(potential_regions) | set(current_regions))
 
                 if sorted(current_regions) != sorted(potential_regions):
                     potential_regions.extend(current_regions)
@@ -441,6 +468,9 @@ def integrate_sub_account(
                 dry_run=dry_run)
             if eks_records:
                 deployed_stacks.extend(eks_records)
+                # active_regions is what update_regions registers just below,
+                # i.e. this account's final registered set.
+                _warn_unregistered_eks_regions(sub_account, eks_records, active_regions)
 
         # Updating the regions in StreamSecurity and waiting
         if not update_regions(graph_client, sub_account, active_regions, not parallel, dry_run=dry_run):

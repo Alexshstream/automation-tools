@@ -22,7 +22,8 @@ from src.python.utilities import organization_integration as oi
 class TestEksAuditLogsActiveRegions(unittest.TestCase):
     def _run_brand_new_account(self, active_regions, backend_cloud_regions,
                                eks_audit_logs=True, eks_audit_logs_regions=None,
-                               eks_audit_logs_auto_detect=False, org_regions=None):
+                               eks_audit_logs_auto_detect=False, org_regions=None,
+                               eks_records_return=None):
         sts_client = MagicMock()
         graph_client = MagicMock()
         # First get_accounts() call (existence check) -> IndexError, so
@@ -47,6 +48,8 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
                 patch.object(oi, "update_regions", return_value=True), \
                 patch.object(oi, "deploy_all_collection_stacks", return_value=None):
             oi_boto3.Session.return_value = session
+            if eks_records_return is not None:
+                mock_eks.return_value = eks_records_return
 
             oi.integrate_sub_account(
                 "https://example.streamsec.io", ("111111111111", "acct"), sts_client, graph_client,
@@ -153,7 +156,8 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
 
     def _run_ready_account(self, potential_regions, registered_cloud_regions,
                            eks_audit_logs=True, eks_audit_logs_regions=None,
-                           eks_audit_logs_auto_detect=False, org_regions=None):
+                           eks_audit_logs_auto_detect=False, org_regions=None,
+                           eks_records_return=None):
         sts_client = MagicMock()
         graph_client = MagicMock()
         graph_client.get_accounts.return_value = [
@@ -173,6 +177,8 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
                 patch.object(oi, "update_regions", return_value=True), \
                 patch.object(oi, "deploy_all_collection_stacks", return_value=None):
             oi_boto3.Session.return_value = session
+            if eks_records_return is not None:
+                mock_eks.return_value = eks_records_return
 
             oi.integrate_sub_account(
                 "https://example.streamsec.io", ("111111111111", "acct"), sts_client, graph_client,
@@ -225,6 +231,91 @@ class TestEksAuditLogsActiveRegions(unittest.TestCase):
         mock_eks.assert_called_once()
         passed_account_information = mock_eks.call_args[0][1]
         self.assertEqual(passed_account_information["cloud_regions"], ["us-east-1"])
+
+
+def _eks_record(region, final_status=None):
+    record = {"account": "111111111111", "name": "acct", "region": region,
+              "stack_type": "eks_audit", "stack_name": f"StreamSecurity-eks-audit-logs-{region}-abc",
+              "stack_id": None if final_status else f"arn:aws:cloudformation:{region}:111111111111:stack/x/y"}
+    if final_status:
+        record["final_status"] = final_status
+        record["status_reason"] = None
+    return record
+
+
+class TestUnregisteredEksRegionWarning(unittest.TestCase):
+    """The backend ingests EKS audit events from any region (collection is
+    token-authenticated, not region-gated), but a cluster in an unregistered
+    region never enters inventory, so its events are stored unlinked. The
+    operator must be told at deploy time - a silent capability gap is the
+    exact failure mode this PR exists to eliminate."""
+
+    def _printed(self, mock_print):
+        return " ".join(str(call) for call in mock_print.call_args_list)
+
+    def test_warns_for_deployed_region_not_in_registered_set(self):
+        with patch("builtins.print") as mock_print:
+            oi._warn_unregistered_eks_regions(
+                ("111111111111", "acct"),
+                [_eks_record("eu-west-1"), _eks_record("us-east-1")],
+                ["us-east-1", "us-west-2"])
+        printed = self._printed(mock_print)
+        self.assertIn("eu-west-1", printed)
+        self.assertIn("--regions", printed)
+        self.assertIn("not linked to inventory", printed)
+
+    def test_silent_when_every_deployed_region_is_registered(self):
+        with patch("builtins.print") as mock_print:
+            oi._warn_unregistered_eks_regions(
+                ("111111111111", "acct"),
+                [_eks_record("us-east-1")],
+                ["us-east-1", "us-west-2"])
+        mock_print.assert_not_called()
+
+    def test_submit_failed_records_do_not_warn(self):
+        # A SUBMIT_FAILED record deployed nothing - its failure is already
+        # reported on its own; warning about enrichment for a collector that
+        # doesn't exist would be misleading.
+        with patch("builtins.print") as mock_print:
+            oi._warn_unregistered_eks_regions(
+                ("111111111111", "acct"),
+                [_eks_record("eu-west-1", final_status="SUBMIT_FAILED")],
+                ["us-east-1"])
+        mock_print.assert_not_called()
+
+    def test_brand_new_account_warning_wired_against_final_registered_set(self):
+        # End-to-end through integrate_sub_account's brand-new branch:
+        # auto-detect deploys a collector in eu-west-1, but only
+        # us-east-1/us-west-2 (active_regions) are about to be registered by
+        # update_regions - the warning must fire for eu-west-1 only.
+        harness = TestEksAuditLogsActiveRegions()
+        with patch("builtins.print") as mock_print:
+            harness._run_brand_new_account(
+                active_regions=["us-east-1", "us-west-2"],
+                backend_cloud_regions=["us-east-1"],
+                eks_audit_logs=False, eks_audit_logs_auto_detect=True,
+                org_regions=["us-east-1", "us-west-2", "eu-west-1"],
+                eks_records_return=[_eks_record("eu-west-1"), _eks_record("us-east-1")])
+        printed = self._printed(mock_print)
+        self.assertIn("EKS audit collector deployed in eu-west-1", printed)
+        self.assertNotIn("EKS audit collector deployed in us-east-1", printed)
+
+    def test_ready_account_warning_compares_against_union_of_current_and_potential(self):
+        # The READY branch registers the UNION of the account's current
+        # regions and the freshly-detected potential regions - a collector in
+        # us-west-2 (potential but not yet current) must NOT warn, while
+        # eu-west-1 (in neither) must.
+        harness = TestEksAuditLogsActiveRegions()
+        with patch("builtins.print") as mock_print:
+            harness._run_ready_account(
+                potential_regions=["us-east-1", "us-west-2"],
+                registered_cloud_regions=["us-east-1"],
+                eks_audit_logs=False, eks_audit_logs_auto_detect=True,
+                org_regions=["us-east-1", "us-west-2", "eu-west-1"],
+                eks_records_return=[_eks_record("eu-west-1"), _eks_record("us-west-2")])
+        printed = self._printed(mock_print)
+        self.assertIn("EKS audit collector deployed in eu-west-1", printed)
+        self.assertNotIn("EKS audit collector deployed in us-west-2", printed)
 
 
 if __name__ == "__main__":
