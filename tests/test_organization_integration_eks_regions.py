@@ -272,6 +272,19 @@ class TestUnregisteredEksRegionWarning(unittest.TestCase):
                 ["us-east-1", "us-west-2"])
         mock_print.assert_not_called()
 
+    def test_dry_run_records_warn_with_conditional_verb(self):
+        # --dry_run deliberately creates nothing, so the warning must say
+        # "would be deployed", not "deployed" - the preview of the
+        # enrichment gap is still wanted, the false claim of action is not.
+        with patch("builtins.print") as mock_print:
+            oi._warn_unregistered_eks_regions(
+                ("111111111111", "acct"),
+                [_eks_record("eu-west-1", final_status="DRY_RUN")],
+                ["us-east-1"])
+        printed = self._printed(mock_print)
+        self.assertIn("EKS audit collector would be deployed in eu-west-1", printed)
+        self.assertNotIn("collector deployed in", printed)
+
     def test_submit_failed_records_do_not_warn(self):
         # A SUBMIT_FAILED record deployed nothing - its failure is already
         # reported on its own; warning about enrichment for a collector that

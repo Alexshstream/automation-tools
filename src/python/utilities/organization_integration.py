@@ -44,15 +44,24 @@ def _warn_unregistered_eks_regions(sub_account, eks_records, registered_regions)
     being linked to inventory resources. A real capability gap the operator
     can close with --regions, so say it at deploy time instead of leaving it
     to be discovered in the UI. SUBMIT_FAILED records deployed nothing, so
-    they're excluded (their failure is already reported on its own)."""
+    they're excluded (their failure is already reported on its own).
+    DRY_RUN records still warn - previewing the enrichment gap is the point
+    of a dry run - but with the conditional verb: claiming something was
+    "deployed" in the one mode whose purpose is deploying nothing would be
+    exactly the false reporting this PR exists to eliminate."""
     registered = set(registered_regions)
-    deployed = {r["region"] for r in eks_records
-                if r.get("final_status") != "SUBMIT_FAILED"}
-    for region in sorted(deployed - registered):
+    verbs = {}
+    for r in eks_records:
+        if r.get("final_status") == "SUBMIT_FAILED" or r["region"] in registered:
+            continue
+        verbs[r["region"]] = ("would be deployed" if r.get("final_status") == "DRY_RUN"
+                              else "deployed")
+    for region in sorted(verbs):
         print(color(
-            f"Account: {sub_account[0]} | EKS audit collector deployed in {region}, which is "
-            f"not a registered region for this account - events will be ingested but not "
-            f"linked to inventory. Add it with --regions for full enrichment.", "yellow"))
+            f"Account: {sub_account[0]} | EKS audit collector {verbs[region]} in {region}, "
+            f"which is not a registered region for this account - events will be ingested "
+            f"but not linked to inventory. Add it with --regions for full enrichment.",
+            "yellow"))
 
 
 def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, parallel,
