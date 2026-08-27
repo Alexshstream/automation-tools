@@ -137,11 +137,21 @@ def get_active_eks_regions(sub_account, sub_account_session, regions):
     # different cause.
     active_regions = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        clients = {region: sub_account_session.client(
-                       'eks', region_name=region, config=LAMBDA_CLIENT_CONFIG)
-                   for region in regions}
-        futures = {executor.submit(_region_has_eks_cluster, clients[region]): region
-                  for region in regions}
+        # Client construction gets the same per-region isolation as the
+        # list_clusters call below - one region failing here (however
+        # unlikely; it's local, no network) must not take down the scan of
+        # every other region, per _region_has_eks_cluster's documented
+        # contract.
+        clients = {}
+        for region in regions:
+            try:
+                clients[region] = sub_account_session.client(
+                    'eks', region_name=region, config=LAMBDA_CLIENT_CONFIG)
+            except Exception as e:
+                print(color(f"Account: {sub_account[0]} | Could not check {region} for "
+                            f"EKS clusters, skipping: {str(e)[:100]}", "yellow"))
+        futures = {executor.submit(_region_has_eks_cluster, client): region
+                  for region, client in clients.items()}
         for future in futures:
             region = futures[future]
             try:

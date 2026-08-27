@@ -1342,6 +1342,34 @@ class TestGetActiveEksRegions(unittest.TestCase):
         self.assertIn("eu-west-1", printed)
         self.assertIn("AccessDenied", printed)
 
+    def test_client_construction_failure_for_one_region_is_isolated_and_logged(self):
+        # Clients are built up-front in the calling thread (thread-safety),
+        # which moved construction outside the per-region worker try/except.
+        # A single region failing at session.client() time must get the same
+        # isolation as a list_clusters() failure: logged, skipped, and the
+        # remaining regions still scanned - not an exception that fails the
+        # whole account.
+        session = MagicMock()
+
+        def client_factory(service, region_name=None, **kwargs):
+            if region_name == "eu-west-1":
+                raise Exception("endpoint resolution failed")
+            client = MagicMock()
+            client.list_clusters.return_value = {"clusters": ["c1"]}
+            return client
+        session.client.side_effect = client_factory
+
+        with patch("builtins.print") as mock_print:
+            result = boto_common.get_active_eks_regions(
+                ("111111111111", "acct"), session, ["us-east-1", "eu-west-1", "us-west-2"])
+
+        self.assertEqual(sorted(result), ["us-east-1", "us-west-2"],
+                         "one region's client-construction failure must not abort "
+                         "the scan of the remaining regions")
+        printed = " ".join(str(call) for call in mock_print.call_args_list)
+        self.assertIn("eu-west-1", printed)
+        self.assertIn("endpoint resolution failed", printed)
+
 
 class TestClassifyStackStatus(unittest.TestCase):
     """main()'s sweep-summary classification, extracted so it's directly
