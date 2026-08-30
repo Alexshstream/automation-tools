@@ -98,6 +98,21 @@ class TestDeployHelpersDryRun(unittest.TestCase):
         for r in records:
             self.assertEqual(r["final_status"], "DRY_RUN")
 
+    def test_deploy_all_collection_stacks_dry_run_does_not_claim_submission(self):
+        # The end-of-function summary line used to say "Collection stacks
+        # submitted" even under --dry_run, where no create_stack call is ever
+        # made - a false claim of action in the mode whose purpose is to make
+        # none (same class as the EKS warning's "would be deployed" fix).
+        session = MagicMock()
+        session.client.return_value = MagicMock()
+        with patch("builtins.print") as mock_print:
+            boto_common.deploy_all_collection_stacks(
+                ["us-east-1"], session, "abc123", self._account_information(),
+                ("111111111111", "acct"), dry_run=True)
+        printed = " ".join(str(call) for call in mock_print.call_args_list)
+        self.assertIn("would be submitted", printed)
+        self.assertNotIn("stacks submitted for regions", printed)
+
     def test_deploy_eks_audit_logs_stacks_dry_run(self):
         session = MagicMock()
         cf_client = MagicMock()

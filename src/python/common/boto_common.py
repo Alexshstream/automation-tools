@@ -271,7 +271,11 @@ def deploy_all_collection_stacks(
             records.append(_stack_record(
                 sub_account, region, "collection", stack_name, None,
                 final_status="SUBMIT_FAILED", status_reason=str(e)[:200]))
-    print(color(f"Account: {sub_account[0]} | Collection stacks submitted for regions: {active_regions}", "blue"))
+    if dry_run:
+        print(color(f"Account: {sub_account[0]} | DRY RUN: collection stacks would be "
+                    f"submitted for regions: {active_regions}", "cyan"))
+    else:
+        print(color(f"Account: {sub_account[0]} | Collection stacks submitted for regions: {active_regions}", "blue"))
     return records
 
 
