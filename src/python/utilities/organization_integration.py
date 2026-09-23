@@ -168,6 +168,9 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         print("Operation canceled.")
         return 0
 
+    # The account step gets ll_url, not the raw --environment_url: the response and
+    # EKS stacks take it as their API URL, and the EKS collector prefix is parsed
+    # out of it, which raised IndexError for a bare host like "acme.streamsec.io".
     failures = []
     all_deployed_stacks = []
     # Account IDs this run created in StreamSecurity (list.append is thread-safe),
@@ -181,7 +184,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
             future_to_account = {
                 executor.submit(
                     integrate_sub_account,
-                    environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
+                    ll_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
                     control_role, org_account_id, parallel, response, response_region, response_exclude_runbooks, eks_audit_logs, eks_audit_logs_regions,
                     eks_audit_logs_auto_detect, dry_run, created_in_stream=created_in_stream
                 ): sub_account for sub_account in sub_accounts
@@ -205,7 +208,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
             account_id = sub_account[0]
             try:
                 account_deployed_stacks = integrate_sub_account(
-                    environment_url, sub_account, sts_client, graph_client, regions, random_int,
+                    ll_url, sub_account, sts_client, graph_client, regions, random_int,
                     custom_tags, regions_to_integrate, control_role, org_account_id, response=response, response_region=response_region, response_exclude_runbooks=response_exclude_runbooks,
                     eks_audit_logs=eks_audit_logs, eks_audit_logs_regions=eks_audit_logs_regions,
                     eks_audit_logs_auto_detect=eks_audit_logs_auto_detect, dry_run=dry_run,
@@ -312,9 +315,12 @@ def integrate_sub_account(
 
         print(color(f"Account: {sub_account[0]} | Checking if integration already exists", "blue"))
         ll_integrated = False
-        try:
-            sub_account_information = \
-                [acc for acc in graph_client.get_accounts() if sub_account[0] == acc["cloud_account_id"]][0]
+        # Only an empty lookup means "not in StreamSecurity yet". This used to be
+        # an `except IndexError: pass` around the whole block below, which sent an
+        # existing account to create_account on any unrelated IndexError.
+        matching_accounts = [acc for acc in graph_client.get_accounts() if sub_account[0] == acc["cloud_account_id"]]
+        if matching_accounts:
+            sub_account_information = matching_accounts[0]
             if sub_account_information["status"] == "UNINITIALIZED":
                 ll_integrated = True
                 print(color(f"Account: {sub_account[0]} | Integrated but uninitialized, continuing", "blue"))
@@ -421,8 +427,6 @@ def integrate_sub_account(
                           f"status at StreamSecurity, remove it and try again"
                 print(color(err_msg, "red"))
                 raise Exception(err_msg)
-        except IndexError:
-            pass
 
         # If account is not already integrated to StreamSecurity
         if not ll_integrated:
