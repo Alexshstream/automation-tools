@@ -168,9 +168,13 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         print("Operation canceled.")
         return 0
 
-    # The account step gets ll_url, not the raw --environment_url: the response and
-    # EKS stacks take it as their API URL, and the EKS collector prefix is parsed
-    # out of it, which raised IndexError for a bare host like "acme.streamsec.io".
+    # The account step gets the normalized base URL (https://<host>), not the raw
+    # --environment_url: the response and EKS stacks take it as their APIUrl, and
+    # the EKS collector prefix is parsed out of it, which raised IndexError for a
+    # bare host like "acme.streamsec.io". No /graphql suffix: the response
+    # template's acknowledge call fails with one, and console-deployed stacks use
+    # the base URL.
+    api_base_url = ll_url[:-len("/graphql")]
     failures = []
     all_deployed_stacks = []
     # Account IDs this run created in StreamSecurity (list.append is thread-safe),
@@ -184,7 +188,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
             future_to_account = {
                 executor.submit(
                     integrate_sub_account,
-                    ll_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
+                    api_base_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
                     control_role, org_account_id, parallel, response, response_region, response_exclude_runbooks, eks_audit_logs, eks_audit_logs_regions,
                     eks_audit_logs_auto_detect, dry_run, created_in_stream=created_in_stream
                 ): sub_account for sub_account in sub_accounts
@@ -208,7 +212,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
             account_id = sub_account[0]
             try:
                 account_deployed_stacks = integrate_sub_account(
-                    ll_url, sub_account, sts_client, graph_client, regions, random_int,
+                    api_base_url, sub_account, sts_client, graph_client, regions, random_int,
                     custom_tags, regions_to_integrate, control_role, org_account_id, response=response, response_region=response_region, response_exclude_runbooks=response_exclude_runbooks,
                     eks_audit_logs=eks_audit_logs, eks_audit_logs_regions=eks_audit_logs_regions,
                     eks_audit_logs_auto_detect=eks_audit_logs_auto_detect, dry_run=dry_run,

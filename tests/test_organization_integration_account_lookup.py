@@ -4,7 +4,9 @@ bare host (--environment_url stpg.stage.lightops.io):
 
 1. main() passed the raw --environment_url to integrate_sub_account, and the EKS
    helper parses the collector prefix with environment_url.split("//")[1], which
-   raised IndexError for a host without a scheme.
+   raised IndexError for a host without a scheme. The fix passes https://<host>
+   with no /graphql: a live response stack failed its acknowledge call with the
+   /graphql form, and every console-deployed response/EKS stack uses the base URL.
 2. That IndexError was swallowed by an `except IndexError: pass` meant only for
    "account not found in StreamSecurity", so an existing READY account fell
    through to create_account.
@@ -80,11 +82,11 @@ class TestMainPassesNormalizedApiUrl(unittest.TestCase):
 
     def test_bare_host(self):
         self.assertEqual(self._url_passed_for("stpg.stage.lightops.io"),
-                         "https://stpg.stage.lightops.io/graphql")
+                         "https://stpg.stage.lightops.io")
 
     def test_full_url(self):
         self.assertEqual(self._url_passed_for("https://acme.streamsec.io"),
-                         "https://acme.streamsec.io/graphql")
+                         "https://acme.streamsec.io")
 
 
 if __name__ == "__main__":

@@ -98,6 +98,26 @@ class TestLambdaHandlerReportsSubmitFailures(unittest.TestCase):
         update_regions = self._run(_record("response"), [_record("eks_audit")])
         update_regions.assert_called_once()
 
+    def test_stacks_get_base_api_url_without_graphql(self):
+        app = self.app
+        with patch.object(app, "deploy_response_stack", return_value=_record("response")) as response, \
+                patch.object(app, "deploy_eks_audit_logs_stacks", return_value=[]) as eks:
+            sub_account = ("123456789012", "acct-name")
+            graph_client = MagicMock()
+            graph_client.get_accounts.side_effect = [[], [{"cloud_account_id": sub_account[0]}]]
+            graph_client.create_account.return_value = True
+            with patch.object(app, "boto3"), \
+                    patch.object(app, "deploy_init_stack", return_value=(True, _record("init"))), \
+                    patch.object(app, "get_active_regions", return_value=["us-east-1"]), \
+                    patch.object(app, "update_regions", return_value=True), \
+                    patch.object(app, "deploy_all_collection_stacks", return_value=[]):
+                app.integrate_sub_account(
+                    sub_account, MagicMock(), graph_client, ["us-east-1"], "abc123",
+                    None, None, "OrganizationAccountAccessRole", sub_account[0],
+                    response=True, eks_audit_logs=True, environment="acme", domain="streamsec.io")
+        self.assertEqual(response.call_args.args[0], "https://acme.streamsec.io")
+        self.assertEqual(eks.call_args.args[0], "https://acme.streamsec.io")
+
 
 if __name__ == "__main__":
     unittest.main()

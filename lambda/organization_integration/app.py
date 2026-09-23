@@ -131,6 +131,10 @@ def integrate_sub_account(
         org_account_id, parallel=False, response=False, response_region="us-east-1", response_exclude_runbooks="", environment=None, domain=None,
         eks_audit_logs=False, eks_audit_logs_regions=None):
     print(color(f"Account: {sub_account[0]} | Starting integration", color="blue"))
+    # The response and EKS stacks take the base URL as APIUrl, without /graphql:
+    # the response template's acknowledge call fails with it, and console-deployed
+    # stacks use the base URL.
+    api_base_url = f"https://{environment}.{domain}"
     try:
         if sub_account[0] == org_account_id:
             sub_account_session = boto3.Session()
@@ -177,12 +181,12 @@ def integrate_sub_account(
                 response_info = graph_client.get_account_response_config(sub_account_information["cloud_account_id"])
                 if (response_info["remediation"] is None or response_info["remediation"]["status"] is None) and response:
                     _raise_on_submit_failure(sub_account, deploy_response_stack(
-                        f"https://{environment}.{domain}/graphql", sub_account_information, sub_account_session, sub_account,
+                        api_base_url, sub_account_information, sub_account_session, sub_account,
                         response_region, random_int, custom_tags, response_exclude_runbooks, wait=False))
                 # Deploying EKS audit logs if enabled
                 if eks_audit_logs:
                     _raise_on_submit_failure(sub_account, deploy_eks_audit_logs_stacks(
-                        f"https://{environment}.{domain}/graphql", sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False))
+                        api_base_url, sub_account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False))
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
                 if regions_to_integrate:
@@ -260,13 +264,13 @@ def integrate_sub_account(
         # Response stack logic for new integrations
         if response:
             _raise_on_submit_failure(sub_account, deploy_response_stack(
-                f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account,
+                api_base_url, account_information, sub_account_session, sub_account,
                 response_region, random_int, custom_tags, response_exclude_runbooks, wait=False))
 
         # Deploying EKS audit logs if enabled
         if eks_audit_logs:
             _raise_on_submit_failure(sub_account, deploy_eks_audit_logs_stacks(
-                f"https://{environment}.{domain}/graphql", account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False))
+                api_base_url, account_information, sub_account_session, sub_account, eks_audit_logs_regions, random_int, custom_tags, wait=False))
 
         if not update_regions(graph_client, sub_account, active_regions, not parallel):
             err_msg = f"Account: {sub_account[0]} | Something went wrong with regions update"
