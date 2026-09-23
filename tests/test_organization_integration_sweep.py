@@ -328,7 +328,7 @@ class TestSweepStackStatuses(unittest.TestCase):
         # Batched per region per tick, not once per stack.
         self.assertEqual(client.describe_stacks.call_count, 1)
 
-    def test_account_describe_stacks_error_marks_unresolved_error_others_unaffected(self):
+    def test_account_describe_stacks_error_times_out_others_unaffected(self):
         mgmt_client = MagicMock()
         mgmt_client.describe_stacks.return_value = {
             "Stacks": [{"StackId": "sid-mgmt", "StackStatus": "CREATE_COMPLETE"}]}
@@ -616,9 +616,10 @@ class TestSweepStackStatuses(unittest.TestCase):
 
 
 class TestWaitForCloudformation(unittest.TestCase):
-    """wait_for_cloudformation is the legacy synchronous single-stack wait
-    (used for the init stack when wait=True, i.e. the default non-parallel
-    path) - distinct from the sweep's own describe_stacks polling, which
+    """wait_for_cloudformation is the legacy synchronous single-stack wait,
+    used whenever a deploy helper runs with wait=True (the init stack on the
+    default non-parallel path, and collection/response/EKS stacks through
+    _try_wait_for_cloudformation) - distinct from the sweep's own describe_stacks polling, which
     already handles pagination. This used to call the unpaginated,
     unfiltered list_stacks() and index [0] into the filtered result - in a
     busy account with enough other stacks that this one landed past page 1,
@@ -638,19 +639,6 @@ class TestWaitForCloudformation(unittest.TestCase):
         self.assertTrue(result)
         client.describe_stacks.assert_called_once_with(StackName="sid-1")
         client.list_stacks.assert_not_called()
-
-    def test_unaffected_by_how_many_other_stacks_exist_in_the_account(self):
-        # The whole point of switching to a targeted, by-ID lookup: unlike
-        # an unpaginated list_stacks() call, this never needs to see (or
-        # care about) any other stack in the account at all.
-        client = MagicMock()
-        client.describe_stacks.return_value = {
-            "Stacks": [{"StackId": "sid-1", "StackStatus": "CREATE_COMPLETE"}]}
-
-        with patch.object(boto_common.time, "sleep"):
-            result = boto_common.wait_for_cloudformation(("111", "acct"), "sid-1", client)
-
-        self.assertTrue(result)
 
     def test_rollback_in_progress_still_raises(self):
         client = MagicMock()
@@ -968,13 +956,17 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
                        "stack/LightlyticsStack-response-us-east-1-42/uuid"}
         session.client.return_value = cf_client
 
-        with patch.object(boto_common, "wait_for_cloudformation", return_value=False):
+        with patch.object(boto_common, "wait_for_cloudformation", return_value=False), \
+                patch("builtins.print") as mock_print:
             record = boto_common.deploy_response_stack(
                 "https://env.streamsec.io/graphql", account_information, session,
                 sub_account, "us-east-1", 42, None, "", wait=True)
 
         self.assertEqual(record["stack_id"], cf_client.create_stack.return_value["StackId"])
         self.assertNotIn("final_status", record)
+        printed = " ".join(str(c.args[0]) for c in mock_print.call_args_list if c.args)
+        self.assertNotIn("deployed successfully", printed)
+        self.assertIn("did not confirm completion", printed)
 
     def test_deploy_eks_audit_logs_stacks_returns_records_only_for_new_regions(self):
         sub_account_information = {"lightlytics_collection_token": "tok", "cloud_regions": []}
@@ -1109,12 +1101,16 @@ class TestDeployHelperRecordShapes(unittest.TestCase):
             return lambda_missing if service == "lambda" else cf_client
         session.client.side_effect = client_factory
 
-        with patch.object(boto_common, "wait_for_cloudformation", return_value=False):
+        with patch.object(boto_common, "wait_for_cloudformation", return_value=False), \
+                patch("builtins.print") as mock_print:
             records = boto_common.deploy_eks_audit_logs_stacks(
                 "https://env.streamsec.io/graphql", sub_account_information, session, sub_account,
                 ["us-east-1"], 42, None, wait=True)
 
         self.assertEqual(records[0]["stack_id"], cf_client.create_stack.return_value["StackId"])
+        printed = " ".join(str(c.args[0]) for c in mock_print.call_args_list if c.args)
+        self.assertNotIn("deployed successfully", printed)
+        self.assertIn("did not confirm completion", printed)
         self.assertNotIn("final_status", records[0])
 
     def test_deploy_eks_audit_logs_stacks_returns_empty_list_when_no_regions(self):

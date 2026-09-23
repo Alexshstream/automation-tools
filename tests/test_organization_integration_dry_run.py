@@ -227,10 +227,9 @@ class TestIntegrateSubAccountDryRunEndToEnd(unittest.TestCase):
 
 
 class TestMainDryRunSummary(unittest.TestCase):
-    """No test anywhere else in the suite runs main() itself in dry_run
-    mode - _classify_stack_status("DRY_RUN") and the "N dry-run (not
-    actually created)" summary line/color in main() are only reachable
-    through the full CLI flow, not through any lower-level unit test."""
+    """The "N dry-run (not actually created)" summary line and its color are
+    only reachable through main() itself, not through a lower-level unit
+    test. Exit codes are covered in test_organization_integration_exit_code.py."""
 
     def test_dry_run_summary_counts_and_color(self):
         import io
@@ -266,7 +265,7 @@ class TestMainDryRunSummary(unittest.TestCase):
             mock_boto3.client.side_effect = boto3_client_dispatch
             stdout_buf = io.StringIO()
             with contextlib.redirect_stdout(stdout_buf):
-                oi.main(
+                rc = oi.main(
                     environment_url="https://example.streamsec.io",
                     ll_username=None, ll_password=None, aws_profile_name=None,
                     accounts="111111111111", parallel=None,
@@ -274,6 +273,7 @@ class TestMainDryRunSummary(unittest.TestCase):
                 )
 
         output = stdout_buf.getvalue()
+        self.assertEqual(rc, 0)
         self.assertIn("1 dry-run (not actually created)", output)
         self.assertIn("0 succeeded, 0 failed, 0 timed out, 0 errored", output)
 

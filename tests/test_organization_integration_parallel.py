@@ -7,6 +7,7 @@ isolate main()'s own aggregation/failure-recovery logic around the executor.
 """
 import os
 import sys
+import inspect
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -25,7 +26,7 @@ class TestMainParallelPath(unittest.TestCase):
         # caller matches locally, so the mock needs the full real set.
         self._all_fake_records = []
 
-    def _run_main(self, accounts, side_effect):
+    def _run_main(self, accounts, side_effect, dry_run=False):
         org_client = MagicMock()
         org_client.list_accounts.return_value = {
             "Accounts": [{"Id": acc_id, "Name": f"acct-{acc_id}", "Status": "ACTIVE"}
@@ -67,11 +68,11 @@ class TestMainParallelPath(unittest.TestCase):
             mock_boto3.client.side_effect = boto3_client_dispatch
             mock_bc_boto3.Session.return_value = sweep_session
 
-            oi.main(
+            return oi.main(
                 environment_url="https://example.streamsec.io",
                 ll_username=None, ll_password=None, aws_profile_name=None,
                 accounts=",".join(accounts), parallel=4,
-                ws_id="ws-1", api_token="fake-token",
+                ws_id="ws-1", api_token="fake-token", dry_run=dry_run,
             )
 
     def test_parallel_aggregates_deployed_stacks_from_every_account(self):
@@ -93,7 +94,9 @@ class TestMainParallelPath(unittest.TestCase):
             return result
 
         with patch.object(oi, "sweep_stack_statuses", side_effect=spy_sweep):
-            self._run_main(["111111111111", "222222222222", "333333333333"], fake_integrate)
+            rc = self._run_main(["111111111111", "222222222222", "333333333333"], fake_integrate)
+
+        self.assertEqual(rc, 0)
 
         swept_accounts = {r["account"] for r in captured_swept}
         self.assertEqual(swept_accounts, {"111111111111", "222222222222", "333333333333"},
@@ -105,10 +108,11 @@ class TestMainParallelPath(unittest.TestCase):
         # the failure (attached to the exception as .deployed_stacks) - the
         # same recovery the sequential path already has, but exercised here
         # through concurrent.futures.as_completed instead.
+        # No final_status: like a real .deployed_stacks record, it must be polled.
         partial_record = {"account": "222222222222", "name": "acct-222222222222",
                           "region": "us-east-1", "stack_type": "init",
-                          "stack_name": "stack-222", "stack_id": "arn:fake:222",
-                          "final_status": "CREATE_COMPLETE"}
+                          "stack_name": "stack-222", "stack_id": "arn:fake:222"}
+        self._all_fake_records.append(partial_record)
 
         def fake_integrate(environment_url, sub_account, *args, **kwargs):
             if sub_account[0] == "111111111111":
@@ -130,16 +134,38 @@ class TestMainParallelPath(unittest.TestCase):
             return result
 
         with patch.object(oi, "sweep_stack_statuses", side_effect=spy_sweep):
-            self._run_main(["111111111111", "222222222222"], fake_integrate)
+            rc = self._run_main(["111111111111", "222222222222"], fake_integrate)
+
+        self.assertEqual(rc, 1, "an account failure in --parallel mode must still exit non-zero")
 
         by_account = {r["account"]: r for r in captured_swept}
         self.assertIn("222222222222", by_account,
                       "a failing account's already-created stack must still be swept/reported, "
                       "not silently lost, in the --parallel path")
-        # It arrived with final_status already set (pre-set on the record
-        # by whatever raised) - sweep_stack_statuses must leave it as-is.
+        # Resolved by the real sweep, not passed through pre-set.
         self.assertEqual(by_account["222222222222"]["final_status"], "CREATE_COMPLETE")
         self.assertIn("111111111111", by_account)
+
+    def test_parallel_passes_arguments_in_the_right_positions(self):
+        # The parallel path passes ~18 arguments positionally; one shifted
+        # argument could turn a dry run into a real deploy. Bind the captured
+        # call against the real signature and check the ones that matter.
+        real_signature = inspect.signature(oi.integrate_sub_account)
+        bound_calls = []
+
+        def fake_integrate(*args, **kwargs):
+            bound_calls.append(real_signature.bind(*args, **kwargs).arguments)
+            return []
+
+        self._run_main(["111111111111"], fake_integrate, dry_run=True)
+
+        self.assertEqual(len(bound_calls), 1)
+        bound = bound_calls[0]
+        self.assertIs(bound["dry_run"], True)
+        self.assertEqual(bound["parallel"], 4)
+        self.assertEqual(bound["sub_account"], ("111111111111", "acct-111111111111"))
+        self.assertEqual(bound["org_account_id"], "999999999999")
+        self.assertIsInstance(bound["created_in_stream"], list)
 
 
 if __name__ == "__main__":

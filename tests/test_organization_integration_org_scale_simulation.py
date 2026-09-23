@@ -103,8 +103,8 @@ class _FakeClock:
     """time.time()/time.sleep() must stay logically consistent for the
     sweep's deadline math to behave correctly, but must not actually block
     real wall-clock time. sleep() advances the fake clock instead of
-    blocking, so a 300s timeout with 10s polls "elapses" after 30 sleep()
-    calls, in milliseconds of real time, not 5 real minutes."""
+    blocking, so the default 600s timeout with 10s polls "elapses" after 60
+    sleep() calls, in milliseconds of real time, not 10 real minutes."""
 
     def __init__(self, start=1_700_000_000.0):
         self.now = start
@@ -316,10 +316,8 @@ class TestOrgScaleSimulation(unittest.TestCase):
         clock = _FakeClock()
 
         # Spy on sweep_stack_statuses (called once, at the very end of
-        # main()) to capture its real return value - main() itself doesn't
-        # return anything (it's a CLI entrypoint), so this is the only way
-        # to assert on each stack's actual final_status/status_reason
-        # without parsing print output for everything.
+        # main()) to capture each stack's final_status/status_reason; main()
+        # itself only returns an overall exit code.
         real_sweep = oi.sweep_stack_statuses
         captured_swept = []
 
@@ -357,7 +355,7 @@ class TestOrgScaleSimulation(unittest.TestCase):
             bc_boto3.Session.side_effect = _make_session
             fake_datetime.utcnow.return_value = fixed_now
 
-            oi.main(
+            rc = oi.main(
                 environment_url="https://example.streamsec.io",
                 ll_username=None, ll_password=None, aws_profile_name=None,
                 accounts=",".join(SCENARIOS.keys()), parallel=None,
@@ -365,12 +363,12 @@ class TestOrgScaleSimulation(unittest.TestCase):
                 response=True, eks_audit_logs_auto_detect=True,
             )
 
+        # This org includes fatal, SUBMIT_FAILED and TIMED_OUT accounts.
+        self.assertEqual(rc, 1)
+
         output = stdout_buf.getvalue()
-        # main() doesn't return anything (CLI entrypoint) - the failures
-        # summary block it prints (`"  {account_id}: {msg}"`, see
-        # organization_integration.py's main()) is the only signal for which
-        # accounts' overall runs raised, so parse it instead of re-deriving
-        # the same logic here.
+        # main()'s exit code is run-wide; the failures block it prints
+        # (`"  {account_id}: {msg}"`) is what says which accounts raised.
         failed_accounts = set(re.findall(r"^  (\d{12}):", output, re.MULTILINE))
 
         by_account = {}
@@ -406,13 +404,21 @@ class TestOrgScaleSimulation(unittest.TestCase):
             ])
 
         with self.subTest(account="2: happy path, has EKS"):
-            # brand new, has EKS - EKS audit stacks in both active regions
-            # (regression test for the active_regions-vs-stale-cloud_regions
-            # EKS detection bug fixed alongside this test).
+            # brand new, has EKS. This run uses eks_audit_logs_auto_detect, so
+            # detection scans every org region (eu-west-1 too, although it has
+            # no EC2 instances) while collection stays on the active regions.
+            # The plain --eks_audit_logs active-regions path is covered in
+            # test_organization_integration_eks_regions.py.
             self.assertNotIn("100000000002", failed_accounts)
-            acc2 = stacks_of("100000000002")
-            self.assertIn(("eks_audit", "us-east-1", "CREATE_COMPLETE"), acc2)
-            self.assertIn(("eks_audit", "us-west-2", "CREATE_COMPLETE"), acc2)
+            self.assertEqual(stacks_of("100000000002"), [
+                ("collection", "us-east-1", "CREATE_COMPLETE"),
+                ("collection", "us-west-2", "CREATE_COMPLETE"),
+                ("eks_audit", "eu-west-1", "CREATE_COMPLETE"),
+                ("eks_audit", "us-east-1", "CREATE_COMPLETE"),
+                ("eks_audit", "us-west-2", "CREATE_COMPLETE"),
+                ("init", "us-east-1", "CREATE_COMPLETE"),
+                ("response", "us-east-1", "CREATE_COMPLETE"),
+            ])
 
         with self.subTest(account="3: bad control role"):
             # never got past assume_role, zero AWS calls.
