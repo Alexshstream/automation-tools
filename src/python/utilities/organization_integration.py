@@ -86,7 +86,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                 raise ValueError("--environment_password is required (or use --api_token instead).")
     except Exception as e:
         print(color(f"Error: {e}", "red"))
-        return
+        return 1
 
     if not ws_id:
         print(color("Warning: --ws_id not set; using the first workspace returned by the API.", "yellow"))
@@ -127,7 +127,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         print(color("Logged in successfully!", "green"))
     except Exception as e:
         print(color(f"Error: {e}", "red"))
-        return
+        return 1
     
     try:
         print(color("Creating Boto3 Session", "blue"))
@@ -156,7 +156,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         print(color(f"Found {len(sub_accounts)} accounts", "blue"))
     except Exception as e: 
         print(color(f"Error: {e}", "red"))
-        return
+        return 1
 
     if accounts:
         sub_accounts = [sa for sa in sub_accounts if sa[0] in accounts]
@@ -166,10 +166,13 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
     confirmation = input("Do you want to continue? Type 'yes' to proceed: ")
     if confirmation.lower() != 'yes':
         print("Operation canceled.")
-        return
+        return 0
 
     failures = []
     all_deployed_stacks = []
+    # Account IDs this run created in StreamSecurity (list.append is thread-safe),
+    # listed at the end of a dry run since that is the one real change it makes.
+    created_in_stream = []
     if parallel:
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
             # `parallel` is passed positionally on purpose: integrate_sub_account uses
@@ -180,7 +183,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                     integrate_sub_account,
                     environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate,
                     control_role, org_account_id, parallel, response, response_region, response_exclude_runbooks, eks_audit_logs, eks_audit_logs_regions,
-                    eks_audit_logs_auto_detect, dry_run
+                    eks_audit_logs_auto_detect, dry_run, created_in_stream=created_in_stream
                 ): sub_account for sub_account in sub_accounts
             }
             for future in concurrent.futures.as_completed(future_to_account):
@@ -205,7 +208,8 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
                     environment_url, sub_account, sts_client, graph_client, regions, random_int,
                     custom_tags, regions_to_integrate, control_role, org_account_id, response=response, response_region=response_region, response_exclude_runbooks=response_exclude_runbooks,
                     eks_audit_logs=eks_audit_logs, eks_audit_logs_regions=eks_audit_logs_regions,
-                    eks_audit_logs_auto_detect=eks_audit_logs_auto_detect, dry_run=dry_run)
+                    eks_audit_logs_auto_detect=eks_audit_logs_auto_detect, dry_run=dry_run,
+                    created_in_stream=created_in_stream)
                 if account_deployed_stacks:
                     all_deployed_stacks.extend(account_deployed_stacks)
             except Exception as e:
@@ -220,6 +224,7 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
     # Every create_stack call above was fire-and-forget (submitted, not waited on).
     # Sweep every stack this run created to find out what actually happened, then
     # print one consolidated, honest summary instead of assuming success.
+    stacks_ok = True
     if all_deployed_stacks:
         print(color(f"Checking final status of {len(all_deployed_stacks)} stack(s)...", "blue"))
         swept_stacks = sweep_stack_statuses(
@@ -256,6 +261,8 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
             f"{succeeded_count} succeeded, {failed_count} failed, "
             f"{timed_out_count} timed out, {errored_count} errored, "
             f"{dry_run_count} dry-run (not actually created)")
+        # TIMED_OUT counts against the exit code: the run could not confirm it.
+        stacks_ok = not (failed_count or errored_count or timed_out_count)
         if failed_count or errored_count:
             print(color(summary, "red"))
         elif timed_out_count:
@@ -269,11 +276,21 @@ def main(environment_url, ll_username, ll_password, aws_profile_name, accounts, 
         # already fully READY in every region) - there is nothing to sweep.
         print(color("Integration finished successfully!", "green"))
 
+    if dry_run and created_in_stream:
+        print(color(
+            f"DRY RUN: {len(created_in_stream)} account(s) were created for real in StreamSecurity and "
+            f"remain UNINITIALIZED until a real run deploys their init stack: "
+            f"{', '.join(sorted(created_in_stream))}", "yellow"))
+
+    # Non-zero whenever anything failed or could not be confirmed, so CI and
+    # wrapper scripts do not read a failed run as a success.
+    return 0 if not failures and stacks_ok else 1
+
 
 def integrate_sub_account(
         environment_url, sub_account, sts_client, graph_client, regions, random_int, custom_tags, regions_to_integrate, control_role,
         org_account_id, parallel=False, response=False, response_region="us-east-1", response_exclude_runbooks="", eks_audit_logs=False, eks_audit_logs_regions=None,
-        eks_audit_logs_auto_detect=False, dry_run=False):
+        eks_audit_logs_auto_detect=False, dry_run=False, created_in_stream=None):
     print(color(f"Account: {sub_account[0]} | Starting integration", color="blue"))
     deployed_stacks = []
     try:
@@ -416,6 +433,8 @@ def integrate_sub_account(
                 print(color(err_msg, "red"))
                 raise Exception(err_msg)
             print(color(f"Account: {sub_account[0]} | Account created successfully", "green"))
+            if created_in_stream is not None:
+                created_in_stream.append(sub_account[0])
 
         print(color(f"Account: {sub_account[0]} | Fetching relevant account information", "blue"))
         account_information = [acc for acc in graph_client.get_accounts()
@@ -599,10 +618,10 @@ if __name__ == "__main__":
              "real backend data; region updates are also preview-only.",
         action="store_true", required=False)
     args = parser.parse_args()
-    main(args.environment_url, args.environment_user_name, args.environment_password,
+    sys.exit(main(args.environment_url, args.environment_user_name, args.environment_password,
          args.aws_profile_name, args.accounts, args.parallel,
          ws_id=args.ws_id, custom_tags=args.custom_tags, regions_to_integrate=args.regions,
          control_role=args.control_role, response=args.response, response_region=args.response_region, response_exclude_runbooks=args.response_exclude_runbooks,
          eks_audit_logs=args.eks_audit_logs, eks_audit_logs_regions=args.eks_audit_logs_regions,
          eks_audit_logs_auto_detect=args.eks_audit_logs_auto_detect, api_token=args.api_token,
-         dry_run=args.dry_run)
+         dry_run=args.dry_run))
