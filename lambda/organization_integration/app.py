@@ -158,6 +158,9 @@ def integrate_sub_account(
             )
             print(color(f"Account: {sub_account[0]} | Session initialized successfully", "green"))
 
+        if regions_to_integrate:
+            regions_to_integrate = _usable_regions(sub_account, sub_account_session, regions_to_integrate)
+
         print(color(f"Account: {sub_account[0]} | Checking if integration already exists", "blue"))
         ll_integrated = False
         # Only an empty lookup means "not in StreamSecurity yet": an IndexError elsewhere
@@ -199,6 +202,7 @@ def integrate_sub_account(
                     potential_regions = list(regions_to_integrate)
                 else:
                     potential_regions = get_active_regions(sub_account_session, regions)
+                    _warn_if_default_regions_only(sub_account, sub_account_session, potential_regions)
                 if sorted(current_regions) != sorted(potential_regions):
                     potential_regions.extend(current_regions)
                     potential_regions = list(set(potential_regions))
@@ -263,13 +267,7 @@ def integrate_sub_account(
         else:
             print(color(f"Account: {sub_account[0]} | Getting active regions (Has EC2 instances)", "blue"))
             active_regions = get_active_regions(sub_account_session, regions)
-            if set(active_regions) <= {sub_account_session.region_name, "us-east-1"}:
-                # A newly vended account has no instances yet, so detection
-                # falls back to the defaults and the account is onboarded
-                # nowhere else. Only REGIONS (org_lambda.py --regions) fixes it.
-                print(color(f"Account: {sub_account[0]} | Warning: no EC2 instances found in any region, "
-                            f"onboarding to {active_regions} only. Set REGIONS (org_lambda.py --regions) "
-                            f"to onboard new accounts to more regions", "yellow"))
+            _warn_if_default_regions_only(sub_account, sub_account_session, active_regions)
         print(color(f"Account: {sub_account[0]} | Active regions are: {active_regions}", "blue"))
 
         # Response stack logic for new integrations
@@ -300,6 +298,38 @@ def integrate_sub_account(
         err_msg = f"Account: {sub_account[0]} | Something went wrong: {e}"
         print(color(err_msg, "red"))
         raise Exception(err_msg)
+
+
+def _usable_regions(sub_account, sub_account_session, regions_to_integrate):
+    """REGIONS is shared by every account in the organization. Drop regions
+    this account hasn't enabled (opt-in regions are enabled per account),
+    rather than failing the account on every run, and always keep us-east-1:
+    edit_regions replaces the account's region list, and global-service
+    events are only delivered there."""
+    try:
+        enabled = {r["RegionName"] for r in sub_account_session.client("ec2").describe_regions()["Regions"]}
+    except ClientError as e:
+        print(color(f"Account: {sub_account[0]} | Could not list enabled regions ({e}), "
+                    f"using REGIONS as is", "yellow"))
+        enabled = set(regions_to_integrate)
+    usable = [r for r in regions_to_integrate if r in enabled]
+    skipped = [r for r in regions_to_integrate if r not in enabled]
+    if skipped:
+        print(color(f"Account: {sub_account[0]} | Warning: skipping {skipped} from REGIONS, "
+                    f"not enabled in this account (or misspelled)", "yellow"))
+    if "us-east-1" not in usable:
+        usable.append("us-east-1")
+    return usable
+
+
+def _warn_if_default_regions_only(sub_account, sub_account_session, detected_regions):
+    # Detection found nothing beyond the regions it always adds. A newly
+    # vended account has no instances yet, so it stays there until instances
+    # appear (then a scheduled scan adds those regions) or REGIONS is set.
+    if set(detected_regions) <= {sub_account_session.region_name, "us-east-1"}:
+        print(color(f"Account: {sub_account[0]} | Warning: no EC2 instances detected outside the default "
+                    f"regions, onboarding to {detected_regions} only. Set REGIONS "
+                    f"(org_lambda.py --regions) to onboard accounts to more regions", "yellow"))
 
 
 def update_regions(graph_client, sub_account, active_regions, wait=True):

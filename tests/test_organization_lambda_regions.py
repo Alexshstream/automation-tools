@@ -16,6 +16,8 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
+from botocore.exceptions import ClientError
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 LAMBDA_DIR = os.path.abspath(os.path.join(
@@ -33,6 +35,14 @@ def _load(filename, module_name, argv=None):
 
 
 BASE_ARGV = ["--environment", "acme", "--ws-id", "ws1", "--api-token", "tok"]
+
+
+def _ec2_with_regions(regions):
+    """ec2 client whose describe_regions returns the given {name: OptInStatus}."""
+    ec2 = MagicMock()
+    ec2.describe_regions.return_value = {
+        "Regions": [{"RegionName": name, "OptInStatus": status} for name, status in regions.items()]}
+    return ec2
 
 
 class TestOrgLambdaRegionsFlag(unittest.TestCase):
@@ -67,32 +77,72 @@ class TestOrgLambdaRegionsFlag(unittest.TestCase):
         self.assertEqual(env_vars["EKS_AUDIT_LOGS"], "true")
         self.assertEqual(env_vars["EKS_AUDIT_LOGS_REGIONS"], "us-east-1")
 
-    def test_help_text_separates_collection_and_response_regions(self):
-        mod = _load("org_lambda.py", "org_lambda_help", BASE_ARGV)
-        helps = {a.dest: a.help for a in mod.parser._actions}
-        self.assertIn("collection", helps["regions"])
-        self.assertIn("response stack only", helps["response_region"])
 
-    def test_blank_regions_flag_leaves_regions_unset(self):
-        mod = _load("org_lambda.py", "org_lambda_blank", BASE_ARGV + ["--regions", " , "])
-        self.assertNotIn("REGIONS", mod._build_env_vars(mod.args))
+class TestOrgLambdaRegionsValidation(unittest.TestCase):
+    """REGIONS applies to every account, so a bad value must stop the deploy."""
+
+    def _main(self, regions_argv, ec2=None):
+        mod = _load("org_lambda.py", "org_lambda_validate", BASE_ARGV + regions_argv)
+        out = io.StringIO()
+        session = MagicMock()
+        session.region_name = "us-east-1"
+        with patch.object(mod, "boto3") as boto3_mock, \
+                patch.object(mod, "_aws_clients", return_value=(MagicMock(), MagicMock(), MagicMock(), MagicMock())) \
+                as clients, \
+                patch("builtins.input", return_value="no") as ask, \
+                redirect_stdout(out):
+            boto3_mock.Session.return_value = session
+            boto3_mock.client.return_value = ec2 or _ec2_with_regions({})
+            mod.main()
+        return out.getvalue(), clients, ask
+
+    def test_typo_stops_before_anything_is_created(self):
+        ec2 = _ec2_with_regions({"us-east-1": "opt-in-not-required", "us-west-2": "opt-in-not-required"})
+        output, _, ask = self._main(["--regions", "us-east-1,us-west2"], ec2)
+        self.assertIn("unknown region(s) in --regions: us-west2", output)
+        ask.assert_not_called()  # never reached the "proceed?" prompt
+
+    def test_valid_regions_continue(self):
+        ec2 = _ec2_with_regions({"us-east-1": "opt-in-not-required", "us-west-2": "opt-in-not-required"})
+        output, _, ask = self._main(["--regions", "us-east-1,us-west-2"], ec2)
+        self.assertNotIn("Error", output)
+        ask.assert_called_once()
+
+    def test_not_enabled_region_warns_but_continues(self):
+        ec2 = _ec2_with_regions({"us-east-1": "opt-in-not-required", "ap-east-1": "not-opted-in"})
+        output, _, ask = self._main(["--regions", "us-east-1,ap-east-1"], ec2)
+        self.assertIn("Warning: ap-east-1 not enabled", output)
+        ask.assert_called_once()
+
+    def test_empty_regions_flag_is_an_error(self):
+        # e.g. --regions "$REGIONS" with the variable unset.
+        output, clients, _ = self._main(["--regions", " , "])
+        self.assertIn("--regions was given but contains no regions", output)
+        clients.assert_not_called()
+
+    def test_missing_regions_flag_prints_notice(self):
+        output, _, ask = self._main([])
+        self.assertIn("--regions not set", output)
+        ask.assert_called_once()
 
 
-class TestNewAccountRegions(unittest.TestCase):
-    """End to end through integrate_sub_account for a brand-new account."""
-
+class _IntegrateHarness(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = _load("app.py", "organization_integration_lambda_app_regions")
 
-    def _run(self, regions_to_integrate, active_regions=("us-east-1",)):
-        app = self.app
-        sub_account = ("123456789012", "acct-name")
-        graph_client = MagicMock()
-        graph_client.get_accounts.side_effect = [[], [{"cloud_account_id": sub_account[0]}]]
-        graph_client.create_account.return_value = True
+    def _session(self, enabled_regions):
         session = MagicMock()
         session.region_name = "us-east-1"
+        if isinstance(enabled_regions, Exception):
+            session.client.return_value.describe_regions.side_effect = enabled_regions
+        else:
+            session.client.return_value = _ec2_with_regions({r: "opt-in-not-required" for r in enabled_regions})
+        return session
+
+    def _integrate(self, graph_client, session, regions_to_integrate, active_regions, **patches):
+        app = self.app
+        sub_account = ("123456789012", "acct-name")
         out = io.StringIO()
         with patch.object(app, "boto3") as boto3_mock, \
                 patch.object(app, "deploy_init_stack", return_value=(True, None)), \
@@ -107,6 +157,17 @@ class TestNewAccountRegions(unittest.TestCase):
                 environment="env", domain="streamsec.io")
         return get_active, update_regions, collection, out.getvalue()
 
+
+class TestNewAccountRegions(_IntegrateHarness):
+    """End to end through integrate_sub_account for a brand-new account."""
+
+    def _run(self, regions_to_integrate, active_regions=("us-east-1",),
+             enabled=("us-east-1", "us-west-2", "eu-west-1")):
+        graph_client = MagicMock()
+        graph_client.get_accounts.side_effect = [[], [{"cloud_account_id": "123456789012"}]]
+        graph_client.create_account.return_value = True
+        return self._integrate(graph_client, self._session(enabled), regions_to_integrate, active_regions)
+
     def test_explicit_regions_are_used_and_ec2_detection_is_skipped(self):
         get_active, update_regions, collection, _ = self._run(["us-east-1", "us-west-2"])
         get_active.assert_not_called()
@@ -115,18 +176,63 @@ class TestNewAccountRegions(unittest.TestCase):
 
     def test_explicit_regions_do_not_warn(self):
         *_, output = self._run(["us-east-1", "us-west-2"])
-        self.assertNotIn("REGIONS", output)
+        self.assertNotIn("Warning", output)
+
+    def test_us_east_1_is_always_kept(self):
+        # edit_regions replaces the account's list; global events land in us-east-1.
+        _, update_regions, collection, _ = self._run(["eu-west-1"])
+        self.assertEqual(update_regions.call_args.args[2], ["eu-west-1", "us-east-1"])
+        self.assertEqual(collection.call_args.args[0], ["eu-west-1", "us-east-1"])
+
+    def test_region_not_enabled_in_account_is_skipped_with_warning(self):
+        _, update_regions, _, output = self._run(["us-east-1", "ap-east-1"])
+        self.assertEqual(update_regions.call_args.args[2], ["us-east-1"])
+        self.assertIn("skipping ['ap-east-1'] from REGIONS", output)
+
+    def test_enabled_regions_lookup_failure_keeps_regions(self):
+        err = ClientError({"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}}, "DescribeRegions")
+        _, update_regions, _, output = self._run(["us-east-1", "us-west-2"], enabled=err)
+        self.assertEqual(update_regions.call_args.args[2], ["us-east-1", "us-west-2"])
+        self.assertIn("Could not list enabled regions", output)
 
     def test_default_regions_only_warns(self):
         # No EC2 anywhere: only the Lambda's region and us-east-1 come back.
         *_, output = self._run(None, active_regions=["us-east-1"])
-        self.assertIn("no EC2 instances found", output)
-        self.assertIn("REGIONS", output)
+        self.assertIn("no EC2 instances detected outside the default regions", output)
         self.assertIn("--regions", output)
 
     def test_ec2_detected_regions_do_not_warn(self):
         *_, output = self._run(None, active_regions=["us-east-1", "us-west-2"])
-        self.assertNotIn("no EC2 instances found", output)
+        self.assertNotIn("Warning", output)
+
+
+class TestReadyAccountRegions(_IntegrateHarness):
+    """Scheduled scans go through the READY path for onboarded accounts."""
+
+    def _run(self, regions_to_integrate, current_regions, active_regions=("us-east-1",)):
+        graph_client = MagicMock()
+        graph_client.get_accounts.return_value = [{
+            "cloud_account_id": "123456789012", "status": "READY", "display_name": "acct-name",
+            "cloud_regions": list(current_regions),
+            "realtime_regions": [{"region_name": r} for r in current_regions]}]
+        graph_client.get_account_response_config.return_value = {"remediation": {"status": "OK"}}
+        session = self._session(("us-east-1", "us-west-2", "eu-west-1"))
+        return self._integrate(graph_client, session, regions_to_integrate, active_regions)
+
+    def test_regions_replace_ec2_detection_for_ready_accounts(self):
+        get_active, update_regions, collection, _ = self._run(["us-east-1", "us-west-2"], ["us-east-1"])
+        get_active.assert_not_called()
+        self.assertEqual(sorted(update_regions.call_args.args[2]), ["us-east-1", "us-west-2"])
+        self.assertEqual(collection.call_args.args[0], ["us-west-2"])
+
+    def test_narrowing_regions_never_removes_onboarded_regions(self):
+        _, update_regions, collection, _ = self._run(["us-east-1"], ["us-east-1", "eu-west-1"])
+        self.assertEqual(sorted(update_regions.call_args.args[2]), ["eu-west-1", "us-east-1"])
+        collection.assert_not_called()
+
+    def test_account_stuck_on_defaults_is_flagged_on_scans(self):
+        *_, output = self._run(None, ["us-east-1"], active_regions=["us-east-1"])
+        self.assertIn("no EC2 instances detected outside the default regions", output)
 
 
 if __name__ == '__main__':

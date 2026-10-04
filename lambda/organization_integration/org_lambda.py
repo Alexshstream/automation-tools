@@ -66,12 +66,25 @@ def _build_env_vars(args):
     if args.eks_audit_logs_regions is not None:
         env_vars["EKS_AUDIT_LOGS_REGIONS"] = args.eks_audit_logs_regions
 
-    # Normalized the way app.py parses it, so the stored value is what runs.
-    regions = ",".join(r.strip() for r in (args.regions or "").split(",") if r.strip())
-    if regions:
-        env_vars["REGIONS"] = regions
+    if args.regions is not None:
+        env_vars["REGIONS"] = ",".join(_parse_regions(args.regions))
 
     return env_vars
+
+
+def _parse_regions(value):
+    return [r.strip() for r in value.split(",") if r.strip()]
+
+
+def _check_regions(requested, ec2_client):
+    """Split --regions into names AWS doesn't know (typos) and real regions
+    that aren't enabled in this account. Opt-in regions can be enabled per
+    account, so the second group is a warning, not an error."""
+    known = {r["RegionName"]: r.get("OptInStatus")
+             for r in ec2_client.describe_regions(AllRegions=True)["Regions"]}
+    unknown = [r for r in requested if r not in known]
+    not_enabled = [r for r in requested if known.get(r) == "not-opted-in"]
+    return unknown, not_enabled
 
 
 def main():
@@ -91,6 +104,10 @@ def main():
         print("Either --api-token, or both --user-name and --password, must be provided (unless --cleanup is specified).")
         return
 
+    if args.regions is not None and not _parse_regions(args.regions):
+        print("Error: --regions was given but contains no regions.")
+        return
+
     iam_client, sts_client, lambda_client, events_client = _aws_clients()
     
     # verify the region is us-east-1
@@ -98,6 +115,22 @@ def main():
     if region != "us-east-1":
         print("The region must be us-east-1.")
         return
+
+    if args.regions is not None:
+        # REGIONS applies to every account in the organization, so one bad
+        # name would fail every account on every run. Stop here instead.
+        unknown, not_enabled = _check_regions(
+            _parse_regions(args.regions), boto3.client('ec2', region_name='us-east-1'))
+        if unknown:
+            print(f"Error: unknown region(s) in --regions: {', '.join(unknown)}. "
+                  f"Check for typos (e.g. us-west-2, not us-west2).")
+            return
+        if not_enabled:
+            print(f"Warning: {', '.join(not_enabled)} not enabled in this account. "
+                  f"Accounts without these regions enabled will skip them.")
+    else:
+        print("Note: --regions not set. Accounts will be onboarded to regions with EC2 instances, "
+              "plus us-east-1, so new accounts without instances get us-east-1 only.")
     
     print("Welcome to the Streamsec Organization Lambda Setup Script!")
     print("This script will perform the following actions:")
