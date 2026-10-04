@@ -18,8 +18,9 @@ parser.add_argument("--accounts", required=False, help="manually specify account
 parser.add_argument("--ws-id", required=False, help="The workspace ID.")
 parser.add_argument("--control-role", default="OrganizationAccountAccessRole", help="The control role name for assuming the role in the target account.", required=False)
 parser.add_argument("--response", action="store_true", help="Enable creation of the response stack.")
-parser.add_argument("--response-region", default="us-east-1", help="Region for response stack.")
+parser.add_argument("--response-region", default="us-east-1", help="Region for the response stack only. Does not affect collection regions, see --regions.")
 parser.add_argument("--response-exclude-runbooks", help="Comma separated list of runbooks to exclude from response stack.")
+parser.add_argument("--regions", required=False, help="Comma separated list of regions to onboard each account to (collection stacks). If omitted, only regions with EC2 instances are detected, plus us-east-1, so new accounts without instances get us-east-1 only.")
 parser.add_argument("--eks-audit-logs", action="store_true", help="Enable creation of the EKS audit logs.")
 parser.add_argument("--eks-audit-logs-regions", required=False, help="Comma separated list of regions to enable EKS audit logs.")
 parser.add_argument("--invoke-after-deploy", action="store_true", help="Invoke the Lambda asynchronously after deploy to onboard existing accounts immediately.")
@@ -39,6 +40,38 @@ def _aws_clients():
         boto3.client('lambda', region_name='us-east-1'),
         boto3.client('events', region_name='us-east-1'),
     )
+
+
+def _build_env_vars(args):
+    env_vars = {
+        "ENVIRONMENT": args.environment,
+        "WS_ID": args.ws_id,
+        "PARALLEL": "8",
+        "CONTROL_ROLE": args.control_role,
+        "RESPONSE": str(args.response).lower(),
+        "RESPONSE_REGION": args.response_region,
+        "EKS_AUDIT_LOGS": str(args.eks_audit_logs).lower(),
+    }
+    if args.api_token:
+        env_vars["API_TOKEN"] = args.api_token
+    else:
+        env_vars["ENVIRONMENT_USER_NAME"] = args.user_name
+        env_vars["ENVIRONMENT_PASSWORD"] = args.password
+    if args.accounts is not None:
+        env_vars["ACCOUNTS"] = args.accounts
+        
+    if args.response_exclude_runbooks is not None:
+        env_vars["RESPONSE_EXCLUDE_RUNBOOKS"] = args.response_exclude_runbooks
+
+    if args.eks_audit_logs_regions is not None:
+        env_vars["EKS_AUDIT_LOGS_REGIONS"] = args.eks_audit_logs_regions
+
+    # Normalized the way app.py parses it, so the stored value is what runs.
+    regions = ",".join(r.strip() for r in (args.regions or "").split(",") if r.strip())
+    if regions:
+        env_vars["REGIONS"] = regions
+
+    return env_vars
 
 
 def main():
@@ -160,28 +193,7 @@ def main():
 
     # Create Lambda function
     function_name = "streamsec-organization-lambda"
-    env_vars = {
-        "ENVIRONMENT": args.environment,
-        "WS_ID": args.ws_id,
-        "PARALLEL": "8",
-        "CONTROL_ROLE": args.control_role,
-        "RESPONSE": str(args.response).lower(),
-        "RESPONSE_REGION": args.response_region,
-        "EKS_AUDIT_LOGS": str(args.eks_audit_logs).lower(),
-    }
-    if args.api_token:
-        env_vars["API_TOKEN"] = args.api_token
-    else:
-        env_vars["ENVIRONMENT_USER_NAME"] = args.user_name
-        env_vars["ENVIRONMENT_PASSWORD"] = args.password
-    if args.accounts is not None:
-        env_vars["ACCOUNTS"] = args.accounts
-        
-    if args.response_exclude_runbooks is not None:
-        env_vars["RESPONSE_EXCLUDE_RUNBOOKS"] = args.response_exclude_runbooks
-
-    if args.eks_audit_logs_regions is not None:
-        env_vars["EKS_AUDIT_LOGS_REGIONS"] = args.eks_audit_logs_regions
+    env_vars = _build_env_vars(args)
 
     with open(zip_filename, 'rb') as f:
         zipped_code = f.read()

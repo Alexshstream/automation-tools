@@ -263,6 +263,13 @@ def integrate_sub_account(
         else:
             print(color(f"Account: {sub_account[0]} | Getting active regions (Has EC2 instances)", "blue"))
             active_regions = get_active_regions(sub_account_session, regions)
+            if set(active_regions) <= {sub_account_session.region_name, "us-east-1"}:
+                # A newly vended account has no instances yet, so detection
+                # falls back to the defaults and the account is onboarded
+                # nowhere else. Only REGIONS (org_lambda.py --regions) fixes it.
+                print(color(f"Account: {sub_account[0]} | Warning: no EC2 instances found in any region, "
+                            f"onboarding to {active_regions} only. Set REGIONS (org_lambda.py --regions) "
+                            f"to onboard new accounts to more regions", "yellow"))
         print(color(f"Account: {sub_account[0]} | Active regions are: {active_regions}", "blue"))
 
         # Response stack logic for new integrations
