@@ -138,6 +138,12 @@ class TestOrgLambdaRegionsValidation(unittest.TestCase):
         self.assertIn("--schedule-scan-days must be a positive integer", output)
         clients.assert_not_called()
 
+    def test_management_account_note_is_boxed(self):
+        output, _, _ = self._main([])
+        self.assertIn("*" * 80 + "\n* NOTE: The Lambda onboards member accounts only.", output)
+        box = [l for l in output.splitlines() if l.startswith("*")]
+        self.assertTrue(all(len(l) == 80 for l in box), box)
+
     def test_regions_shown_before_prompt(self):
         ec2 = _ec2_with_regions({"us-east-1": "opt-in-not-required", "us-west-2": "opt-in-not-required"})
         output, _, ask = self._main(["--regions", "us-east-1, us-west-2"], ec2)

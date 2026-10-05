@@ -6,6 +6,7 @@ import zipfile
 import shutil
 import os
 import tempfile
+import textwrap
 from botocore.exceptions import BotoCoreError, ClientError
 
 parser = argparse.ArgumentParser(description="Streamsec Organization Lambda Setup Script")
@@ -76,6 +77,17 @@ def _build_env_vars(args):
 def _parse_regions(value):
     # Same parsing as app.py, repeats dropped (keeping order).
     return list(dict.fromkeys(r.strip() for r in value.split(",") if r.strip()))
+
+
+BOX_WIDTH = 80
+
+
+def _boxed(text, width=BOX_WIDTH):
+    """Wrap text in an asterisk box so it stands out from the step list."""
+    inner = width - 4
+    lines = textwrap.wrap(text, inner, break_on_hyphens=False)
+    rows = [f"* {line.ljust(inner)} *" for line in lines]
+    return "\n".join(["*" * width] + rows + ["*" * width])
 
 
 def _regions_summary(parsed):
@@ -154,18 +166,23 @@ def main():
             print(f"Warning: region(s) not enabled in the management account: {', '.join(not_enabled)}. "
                   f"Each account is onboarded only to the listed regions it has enabled.")
     
-    print("Welcome to the Streamsec Organization Lambda Setup Script!")
+    print("=" * BOX_WIDTH)
+    print(" Streamsec Organization Lambda Setup")
+    print("=" * BOX_WIDTH)
     print("This script will perform the following actions:")
-    print("1. Create an IAM policy with permissions to list AWS accounts and describe EC2 regions.")
-    print("2. Create an IAM role for the Lambda function with the necessary assume role policy.")
-    print("3. Attach the created policy and the AWS Lambda basic execution role policy to the IAM role.")
-    print("4. Create a Lambda function with the specified configurations.")
-    print(f"   Collection regions: {_regions_summary(regions)}")
-    print("5. Create an EventBridge rule to trigger the Lambda function when a new AWS account is created.")
-    print("6. Add necessary permissions for EventBridge to invoke the Lambda function.")
-    print("7. Set the EventBridge rule target to the Lambda function.")
-    print("Note: the Lambda onboards member accounts only. Onboard this management account once from the "
-          "Stream Security console, or with src/python/utilities/organization_integration.py.")
+    print("  1. Create an IAM policy with permissions to list AWS accounts and describe EC2 regions.")
+    print("  2. Create an IAM role for the Lambda function with the necessary assume role policy.")
+    print("  3. Attach the created policy and the AWS Lambda basic execution role policy to the IAM role.")
+    print("  4. Create a Lambda function with the specified configurations.")
+    print(f"       Collection regions: {_regions_summary(regions)}")
+    print("  5. Create an EventBridge rule to trigger the Lambda function when a new AWS account is created.")
+    print("  6. Add necessary permissions for EventBridge to invoke the Lambda function.")
+    print("  7. Set the EventBridge rule target to the Lambda function.")
+    print()
+    print(_boxed("NOTE: The Lambda onboards member accounts only. Onboard this management account once "
+                 "from the Stream Security console, or with "
+                 "src/python/utilities/organization_integration.py."))
+    print()
 
     proceed = input("Do you want to proceed with these actions? (yes/no): ")
     if proceed.lower() != "yes":
