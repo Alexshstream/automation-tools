@@ -126,6 +126,11 @@ class TestOrgLambdaRegionsValidation(unittest.TestCase):
         self.assertIn("Collection regions: us-east-1, us-west-2 (from --regions)", output)
         ask.assert_called_once()
 
+    def test_us_east_1_shown_as_included_when_not_listed(self):
+        ec2 = _ec2_with_regions({"eu-west-1": "opt-in-not-required"})
+        output, _, _ = self._main(["--regions", "eu-west-1"], ec2)
+        self.assertIn("Collection regions: eu-west-1 (from --regions), plus us-east-1 (always included)", output)
+
     def test_auto_detection_shown_before_prompt_when_regions_omitted(self):
         output, _, ask = self._main([])
         self.assertIn("Collection regions: auto-detected per account", output)

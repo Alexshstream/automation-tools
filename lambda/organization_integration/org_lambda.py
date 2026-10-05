@@ -20,7 +20,7 @@ parser.add_argument("--control-role", default="OrganizationAccountAccessRole", h
 parser.add_argument("--response", action="store_true", help="Enable creation of the response stack.")
 parser.add_argument("--response-region", default="us-east-1", help="Region for the response stack only. Does not affect collection regions, see --regions.")
 parser.add_argument("--response-exclude-runbooks", help="Comma separated list of runbooks to exclude from response stack.")
-parser.add_argument("--regions", required=False, help="Comma separated list of regions to onboard each account to (collection stacks). If omitted, only regions with EC2 instances are detected, plus us-east-1, so new accounts without instances get us-east-1 only.")
+parser.add_argument("--regions", required=False, help="Comma separated list of regions to onboard each account to (collection stacks). us-east-1 is always included. If omitted, only regions with EC2 instances are detected, plus us-east-1, so new accounts without instances get us-east-1 only.")
 parser.add_argument("--eks-audit-logs", action="store_true", help="Enable creation of the EKS audit logs.")
 parser.add_argument("--eks-audit-logs-regions", required=False, help="Comma separated list of regions to enable EKS audit logs.")
 parser.add_argument("--invoke-after-deploy", action="store_true", help="Invoke the Lambda asynchronously after deploy to onboard existing accounts immediately.")
@@ -78,7 +78,11 @@ def _parse_regions(value):
 
 def _regions_summary(regions):
     if regions is not None:
-        return f"{', '.join(_parse_regions(regions))} (from --regions)"
+        # app.py always keeps us-east-1, so show what will actually be deployed.
+        parsed = _parse_regions(regions)
+        if "us-east-1" not in parsed:
+            return f"{', '.join(parsed)} (from --regions), plus us-east-1 (always included)"
+        return f"{', '.join(parsed)} (from --regions)"
     return ("auto-detected per account: regions with EC2 instances, plus us-east-1 "
             "(new accounts without instances get us-east-1 only, set --regions to choose)")
 
