@@ -3,7 +3,7 @@ import random
 import os
 import time
 import concurrent.futures
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from src.python.common.boto_common import *
 from src.python.common.graph_common import GraphCommon
 
@@ -41,7 +41,9 @@ def lambda_handler(event, context):
 
     # Prepare regions if provided
     if regions_to_integrate:
-        regions_to_integrate = [r.strip() for r in regions_to_integrate.split(",") if r.strip()]
+        # dict.fromkeys drops repeats (keeping order): a repeated region would
+        # submit two collection stacks with the same name and fail the account.
+        regions_to_integrate = list(dict.fromkeys(r.strip() for r in regions_to_integrate.split(",") if r.strip()))
 
     print(f"Trying to login into Stream Security environment: {environment}")
     ll_url = f"https://{environment}.{domain}/graphql"
@@ -197,12 +199,14 @@ def integrate_sub_account(
                 print(color(f"Account: {sub_account[0]} | Checking if regions are updated", "blue"))
                 current_regions = sub_account_information["cloud_regions"]
                 if regions_to_integrate:
-                    # A copy: the same list is shared by every account (and thread),
-                    # and it gets extend()'d below.
+                    # A copy: it gets extend()'d below.
                     potential_regions = list(regions_to_integrate)
                 else:
                     potential_regions = get_active_regions(sub_account_session, regions)
-                    _warn_if_default_regions_only(sub_account, sub_account_session, potential_regions)
+                    # Regions already onboarded are kept (merged below), so only
+                    # warn when the account really is on the defaults alone.
+                    _warn_if_default_regions_only(
+                        sub_account, sub_account_session, potential_regions + list(current_regions))
                 if sorted(current_regions) != sorted(potential_regions):
                     potential_regions.extend(current_regions)
                     potential_regions = list(set(potential_regions))
@@ -306,9 +310,10 @@ def _usable_regions(sub_account, sub_account_session, regions_to_integrate):
     rather than failing the account on every run, and always keep us-east-1:
     edit_regions replaces the account's region list, and global-service
     events are only delivered there."""
+    regions_to_integrate = list(dict.fromkeys(regions_to_integrate))
     try:
         enabled = {r["RegionName"] for r in sub_account_session.client("ec2").describe_regions()["Regions"]}
-    except ClientError as e:
+    except (ClientError, BotoCoreError) as e:
         print(color(f"Account: {sub_account[0]} | Could not list enabled regions ({e}), "
                     f"using REGIONS as is", "yellow"))
         enabled = set(regions_to_integrate)
@@ -326,9 +331,11 @@ def _warn_if_default_regions_only(sub_account, sub_account_session, detected_reg
     # Detection found nothing beyond the regions it always adds. A newly
     # vended account has no instances yet, so it stays there until instances
     # appear (then a scheduled scan adds those regions) or REGIONS is set.
+    # get_active_regions swallows API errors, so a failed detection looks
+    # the same.
     if set(detected_regions) <= {sub_account_session.region_name, "us-east-1"}:
         print(color(f"Account: {sub_account[0]} | Warning: no EC2 instances detected outside the default "
-                    f"regions, onboarding to {detected_regions} only. Set REGIONS "
+                    f"regions (or detection failed), onboarding to {sorted(set(detected_regions))} only. Set REGIONS "
                     f"(org_lambda.py --regions) to onboard accounts to more regions", "yellow"))
 
 

@@ -16,7 +16,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -56,6 +56,10 @@ class TestOrgLambdaRegionsFlag(unittest.TestCase):
         mod = _load("org_lambda.py", "org_lambda_regions_ws", BASE_ARGV + ["--regions", " us-east-1, eu-west-1 ,"])
         self.assertEqual(mod._build_env_vars(mod.args)["REGIONS"], "us-east-1,eu-west-1")
 
+    def test_repeated_regions_are_stored_once(self):
+        mod = _load("org_lambda.py", "org_lambda_dupes", BASE_ARGV + ["--regions", "us-west-2,us-east-1,us-west-2"])
+        self.assertEqual(mod._build_env_vars(mod.args)["REGIONS"], "us-west-2,us-east-1")
+
     def test_no_regions_flag_leaves_regions_unset(self):
         mod = _load("org_lambda.py", "org_lambda_no_regions", BASE_ARGV)
         self.assertNotIn("REGIONS", mod._build_env_vars(mod.args))
@@ -81,8 +85,8 @@ class TestOrgLambdaRegionsFlag(unittest.TestCase):
 class TestOrgLambdaRegionsValidation(unittest.TestCase):
     """REGIONS applies to every account, so a bad value must stop the deploy."""
 
-    def _main(self, regions_argv, ec2=None):
-        mod = _load("org_lambda.py", "org_lambda_validate", BASE_ARGV + regions_argv)
+    def _main(self, regions_argv, ec2=None, extra_argv=()):
+        mod = _load("org_lambda.py", "org_lambda_validate", BASE_ARGV + regions_argv + list(extra_argv))
         out = io.StringIO()
         session = MagicMock()
         session.region_name = "us-east-1"
@@ -118,6 +122,20 @@ class TestOrgLambdaRegionsValidation(unittest.TestCase):
         # e.g. --regions "$REGIONS" with the variable unset.
         output, clients, _ = self._main(["--regions", " , "])
         self.assertIn("--regions was given but contains no regions", output)
+        clients.assert_not_called()
+
+    def test_region_check_failure_warns_and_continues(self):
+        ec2 = MagicMock()
+        ec2.describe_regions.side_effect = ClientError(
+            {"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}}, "DescribeRegions")
+        output, _, ask = self._main(["--regions", "us-east-1,us-west-2"], ec2)
+        self.assertIn("could not check --regions", output)
+        self.assertIn("ec2:DescribeRegions", output)
+        ask.assert_called_once()
+
+    def test_negative_schedule_scan_days_stops_before_anything_is_created(self):
+        output, clients, _ = self._main([], extra_argv=["--schedule-scan-days", "-1"])
+        self.assertIn("--schedule-scan-days must be a positive integer", output)
         clients.assert_not_called()
 
     def test_regions_shown_before_prompt(self):
@@ -200,6 +218,17 @@ class TestNewAccountRegions(_IntegrateHarness):
         self.assertEqual(update_regions.call_args.args[2], ["us-east-1"])
         self.assertIn("skipping ['ap-east-1'] from REGIONS", output)
 
+    def test_repeated_regions_deploy_once(self):
+        _, update_regions, collection, _ = self._run(["us-west-2", "us-east-1", "us-west-2"])
+        self.assertEqual(update_regions.call_args.args[2], ["us-west-2", "us-east-1"])
+        self.assertEqual(collection.call_args.args[0], ["us-west-2", "us-east-1"])
+
+    def test_enabled_regions_network_failure_keeps_regions(self):
+        _, update_regions, _, output = self._run(
+            ["us-east-1", "us-west-2"], enabled=EndpointConnectionError(endpoint_url="https://ec2"))
+        self.assertEqual(update_regions.call_args.args[2], ["us-east-1", "us-west-2"])
+        self.assertIn("Could not list enabled regions", output)
+
     def test_enabled_regions_lookup_failure_keeps_regions(self):
         err = ClientError({"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}}, "DescribeRegions")
         _, update_regions, _, output = self._run(["us-east-1", "us-west-2"], enabled=err)
@@ -244,6 +273,11 @@ class TestReadyAccountRegions(_IntegrateHarness):
     def test_account_stuck_on_defaults_is_flagged_on_scans(self):
         *_, output = self._run(None, ["us-east-1"], active_regions=["us-east-1"])
         self.assertIn("no EC2 instances detected outside the default regions", output)
+
+    def test_account_with_onboarded_regions_is_not_flagged_on_scans(self):
+        # Detection finds nothing new, but eu-west-1 is already onboarded and kept.
+        *_, output = self._run(None, ["us-east-1", "eu-west-1"], active_regions=["us-east-1"])
+        self.assertNotIn("Warning", output)
 
 
 if __name__ == '__main__':

@@ -170,7 +170,10 @@ class TestLambdaExistingAccountIsNeverRecreated(unittest.TestCase):
         # One list object is passed to every account; an account with extra
         # registered regions must not leak them into the next account's run.
         shared_regions = ["us-east-1"]
-        self._run_ready(self._ready_graph_client(["us-east-1", "eu-west-1"]), regions_to_integrate=shared_regions)
+        # Pass the list through unchanged, so the run reaches the READY path's
+        # own copy of it (the per-account filter would otherwise return a new list).
+        with patch.object(self.app, "_usable_regions", side_effect=lambda _a, _s, r: r):
+            self._run_ready(self._ready_graph_client(["us-east-1", "eu-west-1"]), regions_to_integrate=shared_regions)
         self.assertEqual(shared_regions, ["us-east-1"])
 
 

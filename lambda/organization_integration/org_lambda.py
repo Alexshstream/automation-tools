@@ -6,6 +6,7 @@ import zipfile
 import shutil
 import os
 import tempfile
+from botocore.exceptions import BotoCoreError, ClientError
 
 parser = argparse.ArgumentParser(description="Streamsec Organization Lambda Setup Script")
 parser.add_argument("--environment", required=False, help="The environment name in which the Lambda function will operate.")
@@ -73,13 +74,13 @@ def _build_env_vars(args):
 
 
 def _parse_regions(value):
-    return [r.strip() for r in value.split(",") if r.strip()]
+    # Same parsing as app.py, repeats dropped (keeping order).
+    return list(dict.fromkeys(r.strip() for r in value.split(",") if r.strip()))
 
 
-def _regions_summary(regions):
-    if regions is not None:
+def _regions_summary(parsed):
+    if parsed is not None:
         # app.py always keeps us-east-1, so show what will actually be deployed.
-        parsed = _parse_regions(regions)
         if "us-east-1" not in parsed:
             return f"{', '.join(parsed)} (from --regions), plus us-east-1 (always included)"
         return f"{', '.join(parsed)} (from --regions)"
@@ -115,8 +116,15 @@ def main():
         print("Either --api-token, or both --user-name and --password, must be provided (unless --cleanup is specified).")
         return
 
-    if args.regions is not None and not _parse_regions(args.regions):
+    regions = _parse_regions(args.regions) if args.regions is not None else None
+    if regions is not None and not regions:
         print("Error: --regions was given but contains no regions.")
+        return
+
+    # Checked before anything is created, so a bad value can't leave a
+    # half-built setup behind.
+    if args.schedule_scan_days and args.schedule_scan_days <= 0:
+        print("Error: --schedule-scan-days must be a positive integer.")
         return
 
     iam_client, sts_client, lambda_client, events_client = _aws_clients()
@@ -127,11 +135,17 @@ def main():
         print("The region must be us-east-1.")
         return
 
-    if args.regions is not None:
+    if regions is not None:
         # REGIONS applies to every account in the organization, so one bad
         # name would fail every account on every run. Stop here instead.
-        unknown, not_enabled = _check_regions(
-            _parse_regions(args.regions), boto3.client('ec2', region_name='us-east-1'))
+        try:
+            unknown, not_enabled = _check_regions(regions, boto3.client('ec2', region_name='us-east-1'))
+        except (ClientError, BotoCoreError) as e:
+            # The Lambda still skips regions an account doesn't have, so this
+            # check is a convenience, not a requirement.
+            print(f"Warning: could not check --regions ({e}). This needs ec2:DescribeRegions; "
+                  f"continuing without the typo check.")
+            unknown, not_enabled = [], []
         if unknown:
             print(f"Error: unknown region(s) in --regions: {', '.join(unknown)}. "
                   f"Check for typos (e.g. us-west-2, not us-west2).")
@@ -146,7 +160,7 @@ def main():
     print("2. Create an IAM role for the Lambda function with the necessary assume role policy.")
     print("3. Attach the created policy and the AWS Lambda basic execution role policy to the IAM role.")
     print("4. Create a Lambda function with the specified configurations.")
-    print(f"   Collection regions: {_regions_summary(args.regions)}")
+    print(f"   Collection regions: {_regions_summary(regions)}")
     print("5. Create an EventBridge rule to trigger the Lambda function when a new AWS account is created.")
     print("6. Add necessary permissions for EventBridge to invoke the Lambda function.")
     print("7. Set the EventBridge rule target to the Lambda function.")
@@ -301,9 +315,6 @@ def main():
     # the PutAccountName CloudTrail event only appears in the member account's
     # trail, not the management account where this EventBridge rule lives.
     if args.schedule_scan_days:
-        if args.schedule_scan_days <= 0:
-            print("Error: --schedule-scan-days must be a positive integer.")
-            return
         scheduled_rule_name = "streamsec-organization-scheduled-scan"
         schedule_expr = f"rate({args.schedule_scan_days} day)" if args.schedule_scan_days == 1 else f"rate({args.schedule_scan_days} days)"
         events_client.put_rule(
