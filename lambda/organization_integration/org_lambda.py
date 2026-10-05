@@ -76,6 +76,13 @@ def _parse_regions(value):
     return [r.strip() for r in value.split(",") if r.strip()]
 
 
+def _regions_summary(regions):
+    if regions is not None:
+        return f"{', '.join(_parse_regions(regions))} (from --regions)"
+    return ("auto-detected per account: regions with EC2 instances, plus us-east-1 "
+            "(new accounts without instances get us-east-1 only, set --regions to choose)")
+
+
 def _check_regions(requested, ec2_client):
     """Split --regions into names AWS doesn't know (typos) and real regions
     that aren't enabled in this account. Opt-in regions can be enabled per
@@ -128,9 +135,6 @@ def main():
         if not_enabled:
             print(f"Warning: {', '.join(not_enabled)} not enabled in this account. "
                   f"Accounts without these regions enabled will skip them.")
-    else:
-        print("Note: --regions not set. Accounts will be onboarded to regions with EC2 instances, "
-              "plus us-east-1, so new accounts without instances get us-east-1 only.")
     
     print("Welcome to the Streamsec Organization Lambda Setup Script!")
     print("This script will perform the following actions:")
@@ -138,6 +142,7 @@ def main():
     print("2. Create an IAM role for the Lambda function with the necessary assume role policy.")
     print("3. Attach the created policy and the AWS Lambda basic execution role policy to the IAM role.")
     print("4. Create a Lambda function with the specified configurations.")
+    print(f"   Collection regions: {_regions_summary(args.regions)}")
     print("5. Create an EventBridge rule to trigger the Lambda function when a new AWS account is created.")
     print("6. Add necessary permissions for EventBridge to invoke the Lambda function.")
     print("7. Set the EventBridge rule target to the Lambda function.")
