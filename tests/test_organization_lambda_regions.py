@@ -280,5 +280,52 @@ class TestReadyAccountRegions(_IntegrateHarness):
         self.assertNotIn("Warning", output)
 
 
+class TestManagementAccountIsSkipped(unittest.TestCase):
+    """The Lambda can't deploy stacks in the management account: its own role
+    only lists accounts/regions, and OrganizationAccountAccessRole only exists
+    in member accounts. It must skip it with a clear message, not fail."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _load("app.py", "organization_integration_lambda_app_mgmt")
+
+    def _handler(self, env_extra=None):
+        app = self.app
+        env = {"ENVIRONMENT": "acme", "API_TOKEN": "t", "WS_ID": "ws", "PARALLEL": "0"}
+        env.update(env_extra or {})
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "111111111111"}
+        ec2 = MagicMock()
+        ec2.describe_regions.return_value = {"Regions": [{"RegionName": "us-east-1"}]}
+        out = io.StringIO()
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(app, "GraphCommon"), \
+                patch.object(app, "boto3") as boto3_mock, \
+                patch.object(app, "get_all_accounts", return_value=[
+                    {"Id": "111111111111", "Name": "mgmt", "Status": "ACTIVE"},
+                    {"Id": "222222222222", "Name": "member", "Status": "ACTIVE"}]), \
+                patch.object(app, "integrate_sub_account") as integrate, \
+                redirect_stdout(out):
+            boto3_mock.client.side_effect = lambda service, **kw: {"sts": sts, "ec2": ec2}.get(service, MagicMock())
+            app.lambda_handler({}, None)
+        return [c.args[0][0] for c in integrate.call_args_list], out.getvalue()
+
+    def test_management_account_is_not_integrated(self):
+        integrated, output = self._handler()
+        self.assertEqual(integrated, ["222222222222"])
+        self.assertIn("Skipping management account 111111111111", output)
+        self.assertIn("organization_integration.py", output)
+
+    def test_management_account_skipped_even_when_listed_in_accounts(self):
+        integrated, output = self._handler({"ACCOUNTS": "111111111111,222222222222"})
+        self.assertEqual(integrated, ["222222222222"])
+        self.assertIn("Skipping management account 111111111111", output)
+
+    def test_no_skip_message_when_management_account_not_selected(self):
+        integrated, output = self._handler({"ACCOUNTS": "222222222222"})
+        self.assertEqual(integrated, ["222222222222"])
+        self.assertNotIn("Skipping management account", output)
+
+
 if __name__ == '__main__':
     unittest.main()

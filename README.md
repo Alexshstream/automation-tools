@@ -24,6 +24,8 @@ Script execution with the AWS profile flag:
 ## Organization Lambda (auto onboarding of new accounts)
 `lambda/organization_integration/org_lambda.py` deploys the `streamsec-organization-lambda` function in the organization management account. The Lambda onboards new accounts as they are created.
 
+The Lambda onboards member accounts only, and skips the management account with a message in its log. It reaches member accounts through `OrganizationAccountAccessRole`, which AWS doesn't create in the management account, and its own role can't deploy stacks. Onboard the management account once from the Stream Security console, or with the "organization based integration" tool above, which runs with your own credentials.
+
 ```python lambda/organization_integration/org_lambda.py --environment <ENV_NAME> --ws-id <WS_ID> --api-token <API_TOKEN> --regions us-east-1,us-west-2,eu-west-1```
 
 Regions:

@@ -164,6 +164,8 @@ def main():
     print("5. Create an EventBridge rule to trigger the Lambda function when a new AWS account is created.")
     print("6. Add necessary permissions for EventBridge to invoke the Lambda function.")
     print("7. Set the EventBridge rule target to the Lambda function.")
+    print("Note: the Lambda onboards member accounts only. Onboard this management account once from the "
+          "Stream Security console, or with src/python/utilities/organization_integration.py.")
 
     proceed = input("Do you want to proceed with these actions? (yes/no): ")
     if proceed.lower() != "yes":

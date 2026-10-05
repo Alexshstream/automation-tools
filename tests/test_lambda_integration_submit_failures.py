@@ -218,7 +218,7 @@ class TestLambdaEksRegionsAndParsing(unittest.TestCase):
                 patch.object(app, "GraphCommon"), \
                 patch.object(app, "boto3") as boto3_mock, \
                 patch.object(app, "get_all_accounts",
-                             return_value=[{"Id": "123456789012", "Name": "a", "Status": "ACTIVE"}]), \
+                             return_value=[{"Id": "210987654321", "Name": "a", "Status": "ACTIVE"}]), \
                 patch.object(app, "integrate_sub_account") as integrate:
             boto3_mock.client.side_effect = lambda service, **kw: {"sts": sts, "ec2": ec2}.get(service, MagicMock())
             app.lambda_handler({}, None)
