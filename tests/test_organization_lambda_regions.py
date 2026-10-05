@@ -4,9 +4,9 @@ Collection-stack regions for the organization Lambda.
 Without REGIONS, a brand-new account resolves its regions through
 get_active_regions(), which only counts regions with EC2 instances. A freshly
 vended account has none, so it was onboarded in the Lambda's region and
-us-east-1 only. app.py has honoured REGIONS since 2024, but org_lambda.py had
-no way to set it, and RESPONSE_REGION (which customers assumed controls this)
-only places the response stack.
+us-east-1 only. app.py honours REGIONS, but org_lambda.py had no way to set
+it, and RESPONSE_REGION (which customers assumed controls this) only places
+the response stack.
 """
 import importlib.util
 import io
@@ -320,6 +320,7 @@ class TestManagementAccountIsSkipped(unittest.TestCase):
         integrated, output = self._handler()
         self.assertEqual(integrated, ["222222222222"])
         self.assertIn("Skipping management account 111111111111", output)
+        self.assertIn("its own role, which can't deploy stacks", output)
         self.assertIn("organization_integration.py", output)
 
     def test_management_account_skipped_even_when_listed_in_accounts(self):

@@ -82,11 +82,10 @@ def lambda_handler(event, context):
     # in the management account, and its own role can't deploy stacks.
     if any(sa[0] == org_account_id for sa in sub_accounts):
         sub_accounts = [sa for sa in sub_accounts if sa[0] != org_account_id]
-        print(color(f"Skipping management account {org_account_id}: this Lambda only onboards member accounts "
-                    f"(it reaches them through {control_role}, which doesn't exist in the management account, "
-                    f"and its own role can't deploy stacks). Onboard the management account once from the "
-                    f"Stream Security console, or with src/python/utilities/organization_integration.py "
-                    f"using your own credentials", "yellow"))
+        print(color(f"Skipping management account {org_account_id}: this Lambda only onboards member accounts. "
+                    f"In the management account it would have to use its own role, which can't deploy stacks. "
+                    f"Onboard the management account once from the Stream Security console, or with "
+                    f"src/python/utilities/organization_integration.py using your own credentials", "yellow"))
 
     print(f"Accounts to-be integrated: {[sa[0] for sa in sub_accounts]}")
 
