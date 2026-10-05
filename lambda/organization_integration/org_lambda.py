@@ -148,11 +148,11 @@ def main():
             unknown, not_enabled = [], []
         if unknown:
             print(f"Error: unknown region(s) in --regions: {', '.join(unknown)}. "
-                  f"Check for typos (e.g. us-west-2, not us-west2).")
+                  f"Check for typos; region names look like us-west-2.")
             return
         if not_enabled:
-            print(f"Warning: {', '.join(not_enabled)} not enabled in this account. "
-                  f"Accounts without these regions enabled will skip them.")
+            print(f"Warning: region(s) not enabled in the management account: {', '.join(not_enabled)}. "
+                  f"Each account is onboarded only to the listed regions it has enabled.")
     
     print("Welcome to the Streamsec Organization Lambda Setup Script!")
     print("This script will perform the following actions:")

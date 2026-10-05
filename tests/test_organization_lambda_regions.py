@@ -115,7 +115,7 @@ class TestOrgLambdaRegionsValidation(unittest.TestCase):
     def test_not_enabled_region_warns_but_continues(self):
         ec2 = _ec2_with_regions({"us-east-1": "opt-in-not-required", "ap-east-1": "not-opted-in"})
         output, _, ask = self._main(["--regions", "us-east-1,ap-east-1"], ec2)
-        self.assertIn("Warning: ap-east-1 not enabled", output)
+        self.assertIn("Warning: region(s) not enabled in the management account: ap-east-1", output)
         ask.assert_called_once()
 
     def test_empty_regions_flag_is_an_error(self):
