@@ -234,6 +234,17 @@ def integrate_sub_account(
                     realtime_regions = []
                 realtime_region_names = [r["region_name"] for r in realtime_regions]
                 regions_to_integrate = [i for i in potential_regions if i not in realtime_region_names]
+                if regions_to_integrate:
+                    # The merge above keeps every registered region, including
+                    # ones the account has since disabled. Deploying there would
+                    # fail the account on every scan, so only deploy to enabled ones.
+                    enabled = _enabled_regions(sub_account, sub_account_session)
+                    if enabled is not None:
+                        not_enabled = [r for r in regions_to_integrate if r not in enabled]
+                        if not_enabled:
+                            print(color(f"Account: {sub_account[0]} | Warning: not deploying collection to "
+                                        f"{not_enabled}, not enabled in this account", "yellow"))
+                        regions_to_integrate = [r for r in regions_to_integrate if r in enabled]
                 if len(regions_to_integrate) > 0:
                     print(color(f"Account: {sub_account[0]} | Realtime is not enabled on all regions, "
                                 f"adding support for {regions_to_integrate}", "blue"))
@@ -314,6 +325,17 @@ def integrate_sub_account(
         raise Exception(err_msg)
 
 
+def _enabled_regions(sub_account, sub_account_session):
+    """Regions enabled in this account, or None if they can't be listed (the
+    caller then keeps its regions as they are)."""
+    try:
+        return {r["RegionName"] for r in sub_account_session.client("ec2").describe_regions()["Regions"]}
+    except (ClientError, BotoCoreError) as e:
+        print(color(f"Account: {sub_account[0]} | Could not list enabled regions ({e}), "
+                    f"using regions as is", "yellow"))
+        return None
+
+
 def _usable_regions(sub_account, sub_account_session, regions_to_integrate):
     """REGIONS is shared by every account in the organization. Drop regions
     this account hasn't enabled (opt-in regions are enabled per account),
@@ -321,11 +343,8 @@ def _usable_regions(sub_account, sub_account_session, regions_to_integrate):
     edit_regions replaces the account's region list, and global-service
     events are only delivered there."""
     regions_to_integrate = list(dict.fromkeys(regions_to_integrate))
-    try:
-        enabled = {r["RegionName"] for r in sub_account_session.client("ec2").describe_regions()["Regions"]}
-    except (ClientError, BotoCoreError) as e:
-        print(color(f"Account: {sub_account[0]} | Could not list enabled regions ({e}), "
-                    f"using REGIONS as is", "yellow"))
+    enabled = _enabled_regions(sub_account, sub_account_session)
+    if enabled is None:
         enabled = set(regions_to_integrate)
     usable = [r for r in regions_to_integrate if r in enabled]
     skipped = [r for r in regions_to_integrate if r not in enabled]

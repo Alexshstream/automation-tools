@@ -255,12 +255,14 @@ class TestNewAccountRegions(_IntegrateHarness):
 class TestReadyAccountRegions(_IntegrateHarness):
     """Scheduled scans go through the READY path for onboarded accounts."""
 
-    def _run(self, regions_to_integrate, current_regions, active_regions=("us-east-1",)):
+    def _run(self, regions_to_integrate, current_regions, active_regions=("us-east-1",), realtime_regions=None):
+        if realtime_regions is None:
+            realtime_regions = current_regions
         graph_client = MagicMock()
         graph_client.get_accounts.return_value = [{
             "cloud_account_id": "123456789012", "status": "READY", "display_name": "acct-name",
             "cloud_regions": list(current_regions),
-            "realtime_regions": [{"region_name": r} for r in current_regions]}]
+            "realtime_regions": [{"region_name": r} for r in realtime_regions]}]
         graph_client.get_account_response_config.return_value = {"remediation": {"status": "OK"}}
         session = self._session(("us-east-1", "us-west-2", "eu-west-1"))
         return self._integrate(graph_client, session, regions_to_integrate, active_regions)
@@ -275,6 +277,23 @@ class TestReadyAccountRegions(_IntegrateHarness):
         _, update_regions, collection, _ = self._run(["us-east-1"], ["us-east-1", "eu-west-1"])
         self.assertEqual(sorted(update_regions.call_args.args[2]), ["eu-west-1", "us-east-1"])
         collection.assert_not_called()
+
+    def test_disabled_registered_region_is_not_deployed(self):
+        # ap-east-1 is registered on the account but no longer enabled in it
+        # (the harness session only enables us-east-1, us-west-2, eu-west-1).
+        # Merging current regions back in must not send it to collection.
+        _, update_regions, collection, output = self._run(
+            ["us-east-1", "us-west-2"], ["us-east-1", "ap-east-1"], realtime_regions=["us-east-1"])
+        self.assertEqual(sorted(update_regions.call_args.args[2]), ["ap-east-1", "us-east-1", "us-west-2"])
+        self.assertEqual(collection.call_args.args[0], ["us-west-2"])
+        self.assertIn("not deploying collection to ['ap-east-1']", output)
+
+    def test_disabled_registered_region_alone_deploys_nothing(self):
+        # Same without REGIONS (EC2 detection path).
+        _, _, collection, output = self._run(
+            None, ["us-east-1", "ap-east-1"], active_regions=["us-east-1"], realtime_regions=["us-east-1"])
+        collection.assert_not_called()
+        self.assertIn("not deploying collection to ['ap-east-1']", output)
 
     def test_account_stuck_on_defaults_is_flagged_on_scans(self):
         *_, output = self._run(None, ["us-east-1"], active_regions=["us-east-1"])
